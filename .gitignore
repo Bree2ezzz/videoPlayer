@@ -1,0 +1,4 @@
+build/
+.codex/
+.agents/
+CMakeLists.txt.user
