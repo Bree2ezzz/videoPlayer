@@ -5,7 +5,7 @@ project(videoplayer VERSION 0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets QuickWidgets Qml)
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
 qt_standard_project_setup()
 
@@ -28,29 +28,11 @@ qt_add_executable(videoplayer
     FrameQueue.h
 )
 
-qt_add_resources(videoplayer "qml"
-    PREFIX "/"
-    FILES
-        qml/PlayerControls.qml
-        qml/IconButton.qml
-        qml/TimeLabel.qml
-        qml/Toast.qml
-        resources/icons/play.svg
-        resources/icons/play_filled.svg
-        resources/icons/pause.svg
-        resources/icons/volume.svg
-        resources/icons/volume_muted.svg
-        resources/icons/fullscreen.svg
-        resources/icons/fullscreen_exit.svg
-        resources/icons/prev_frame.svg
-        resources/icons/next_frame.svg
-)
-
 set(FFMPEG_DIR "D:/ffmpeg")
 set(SDL2_DIR "D:/SDL2-devel-2.30.5-mingw/SDL2-2.30.5/x86_64-w64-mingw32")
 target_include_directories(videoplayer PRIVATE "${FFMPEG_DIR}/include" "${SDL2_DIR}/include")
 target_link_directories(videoplayer PRIVATE "${FFMPEG_DIR}/lib" "${SDL2_DIR}/lib")
-target_link_libraries(videoplayer PRIVATE Qt6::Widgets Qt6::QuickWidgets Qt6::Qml avformat
+target_link_libraries(videoplayer PRIVATE Qt6::Widgets avformat
     avcodec
     avutil
     swscale

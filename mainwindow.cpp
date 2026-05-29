@@ -7,6 +7,7 @@
 #include <QAction>
 #include <QCloseEvent>
 #include <QFileDialog>
+#include <QHBoxLayout>
 #include <QInputDialog>
 #include <QKeyEvent>
 #include <QLabel>
@@ -16,12 +17,48 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QObject>
-#include <QQmlContext>
-#include <QQuickItem>
-#include <QQuickWidget>
-#include <QStackedLayout>
+#include <QPushButton>
+#include <QSizePolicy>
+#include <QSlider>
 #include <QStatusBar>
 #include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace {
+
+constexpr int kProgressSliderScale = 1000;
+
+int progressSliderMax(double durationSec)
+{
+    if (!std::isfinite(durationSec) || durationSec <= 0.0) {
+        return kProgressSliderScale;
+    }
+
+    const double scaled = durationSec * kProgressSliderScale;
+    const double maxInt = static_cast<double>(std::numeric_limits<int>::max());
+    return static_cast<int>(std::clamp(scaled, 1.0, maxInt));
+}
+
+int progressSliderValue(double positionSec)
+{
+    if (!std::isfinite(positionSec) || positionSec <= 0.0) {
+        return 0;
+    }
+
+    const double scaled = positionSec * kProgressSliderScale;
+    const double maxInt = static_cast<double>(std::numeric_limits<int>::max());
+    return static_cast<int>(std::clamp(scaled, 0.0, maxInt));
+}
+
+double progressSliderSeconds(int value)
+{
+    return static_cast<double>(value) / kProgressSliderScale;
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent),
@@ -32,20 +69,29 @@ MainWindow::MainWindow(QWidget* parent)
     setWindowTitle(QStringLiteral("VideoPlayer"));
     setMouseTracking(true);
 
-    videoContainer_ = ui_->centralwidget;
-    videoContainer_->setMouseTracking(true);
-    videoContainer_->setAutoFillBackground(false);
-    if (videoContainer_->layout()) {
-        delete videoContainer_->layout();
+    QWidget* central = ui_->centralwidget;
+    central->setMouseTracking(true);
+    central->setAutoFillBackground(false);
+    if (central->layout()) {
+        delete central->layout();
     }
 
-    overlayLayout_ = new QStackedLayout(videoContainer_);
-    overlayLayout_->setContentsMargins(0, 0, 0, 0);
-    overlayLayout_->setSpacing(0);
-    overlayLayout_->setStackingMode(QStackedLayout::StackAll);
+    auto* mainLayout = new QVBoxLayout(central);
+    mainLayout->setContentsMargins(0, 0, 0, 0);
+    mainLayout->setSpacing(0);
+
+    videoContainer_ = new QWidget(central);
+    videoContainer_->setMouseTracking(true);
+    videoContainer_->setAutoFillBackground(false);
+    videoContainer_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    mainLayout->addWidget(videoContainer_, 1);
+
+    videoLayout_ = new QVBoxLayout(videoContainer_);
+    videoLayout_->setContentsMargins(0, 0, 0, 0);
+    videoLayout_->setSpacing(0);
 
     installRenderer(RendererKind::Software);
-    setupControlsQml();
+    setupControlsWidget();
 
     QMenu* fileMenu = menuBar()->addMenu(QStringLiteral("File"));
     QAction* openFileAction = fileMenu->addAction(QStringLiteral("Open File..."));
@@ -81,6 +127,14 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onErrorOccurred);
     connect(controller_, &PlaybackController::endOfStream,
             this, &MainWindow::onEndOfStream);
+    connect(controller_, &PlaybackController::volumeChanged,
+            this, [this](float volume) {
+                updateVolumeControls(volume, controller_->isMuted());
+            });
+    connect(controller_, &PlaybackController::mutedChanged,
+            this, [this](bool muted) {
+                updateVolumeControls(controller_->volume(), muted);
+            });
 
     statusLabel_ = new QLabel(statusBar());
     statusLabel_->setMinimumWidth(260);
@@ -224,17 +278,22 @@ void MainWindow::onAbout()
 void MainWindow::onStateChanged(PlaybackController::State)
 {
     updateStatusBar();
+    updateControlsState();
 }
 
 void MainWindow::onMediaLoaded()
 {
     updateStatusBar();
+    updatePositionControls(controller_->positionSec(), controller_->durationSec());
+    updateVolumeControls(controller_->volume(), controller_->isMuted());
+    updateControlsState();
     statusBar()->showMessage(QStringLiteral("Media loaded"), 2000);
 }
 
-void MainWindow::onPositionChanged(double, double)
+void MainWindow::onPositionChanged(double positionSec, double durationSec)
 {
     updateStatusBar();
+    updatePositionControls(positionSec, durationSec);
 }
 
 void MainWindow::onErrorOccurred(int, const QString& msg)
@@ -246,6 +305,7 @@ void MainWindow::onEndOfStream()
 {
     statusBar()->showMessage(QStringLiteral("End of stream"), 3000);
     updateStatusBar();
+    updateControlsState();
 }
 
 void MainWindow::installRenderer(RendererKind kind)
@@ -261,8 +321,8 @@ void MainWindow::installRenderer(RendererKind kind)
     auto* renderer = new SoftwareRenderer(videoContainer_);
     renderer_ = renderer;
 
-    if (overlayLayout_) {
-        overlayLayout_->insertWidget(0, renderer->asWidget());
+    if (videoLayout_) {
+        videoLayout_->addWidget(renderer->asWidget());
     }
 
     if (controller_) {
@@ -281,32 +341,184 @@ void MainWindow::removeCurrentRenderer()
     }
 
     QWidget* widget = renderer_->asWidget();
-    if (overlayLayout_ && widget) {
-        overlayLayout_->removeWidget(widget);
+    if (videoLayout_ && widget) {
+        videoLayout_->removeWidget(widget);
     }
     delete widget;
     renderer_ = nullptr;
 }
 
-void MainWindow::setupControlsQml()
+void MainWindow::setupControlsWidget()
 {
-    controlsQml_ = new QQuickWidget(videoContainer_);
-    controlsQml_->setResizeMode(QQuickWidget::SizeRootObjectToView);
-    controlsQml_->setClearColor(Qt::transparent);
-    controlsQml_->setAttribute(Qt::WA_AlwaysStackOnTop);
-    controlsQml_->setAttribute(Qt::WA_TranslucentBackground);
-    controlsQml_->setMouseTracking(true);
-    controlsQml_->rootContext()->setContextProperty(QStringLiteral("controller"), controller_);
-    controlsQml_->setSource(QUrl(QStringLiteral("qrc:/qml/PlayerControls.qml")));
+    controlsWidget_ = new QWidget(ui_->centralwidget);
+    controlsWidget_->setObjectName(QStringLiteral("controlsWidget"));
+    controlsWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    controlsWidget_->setFocusPolicy(Qt::NoFocus);
+    controlsWidget_->setFixedHeight(76);
+    controlsWidget_->setStyleSheet(QStringLiteral(
+        "#controlsWidget { background-color: #111111; }"
+        "QLabel { color: #dddddd; }"
+        "QPushButton { color: #eeeeee; background-color: #242424; border: 1px solid #444444; border-radius: 4px; padding: 3px 8px; }"
+        "QPushButton:disabled { color: #777777; background-color: #1a1a1a; }"
+        "QPushButton:hover:!disabled { background-color: #303030; }"
+        "QSlider::groove:horizontal { height: 4px; background: #444444; border-radius: 2px; }"
+        "QSlider::sub-page:horizontal { background: #4fc3f7; border-radius: 2px; }"
+        "QSlider::handle:horizontal { width: 12px; margin: -5px 0; border-radius: 6px; background: #f5f5f5; }"
+    ));
 
-    if (overlayLayout_) {
-        overlayLayout_->addWidget(controlsQml_);
+    auto* outerLayout = new QVBoxLayout(controlsWidget_);
+    outerLayout->setContentsMargins(12, 6, 12, 6);
+    outerLayout->setSpacing(4);
+
+    auto* progressRow = new QHBoxLayout();
+    progressRow->setContentsMargins(0, 0, 0, 0);
+    progressRow->setSpacing(8);
+
+    currentTimeLabel_ = new QLabel(formatTime(0.0), controlsWidget_);
+    currentTimeLabel_->setMinimumWidth(52);
+    currentTimeLabel_->setAlignment(Qt::AlignCenter);
+
+    progressSlider_ = new QSlider(Qt::Horizontal, controlsWidget_);
+    progressSlider_->setRange(0, kProgressSliderScale);
+    progressSlider_->setEnabled(false);
+    progressSlider_->setFocusPolicy(Qt::NoFocus);
+
+    durationLabel_ = new QLabel(formatTime(0.0), controlsWidget_);
+    durationLabel_->setMinimumWidth(52);
+    durationLabel_->setAlignment(Qt::AlignCenter);
+
+    progressRow->addWidget(currentTimeLabel_);
+    progressRow->addWidget(progressSlider_, 1);
+    progressRow->addWidget(durationLabel_);
+
+    auto* buttonRow = new QHBoxLayout();
+    buttonRow->setContentsMargins(0, 0, 0, 0);
+    buttonRow->setSpacing(8);
+
+    muteButton_ = new QPushButton(QStringLiteral("Mute"), controlsWidget_);
+    muteButton_->setEnabled(false);
+    muteButton_->setFocusPolicy(Qt::NoFocus);
+
+    volumeSlider_ = new QSlider(Qt::Horizontal, controlsWidget_);
+    volumeSlider_->setRange(0, 100);
+    volumeSlider_->setValue(100);
+    volumeSlider_->setFixedWidth(110);
+    volumeSlider_->setEnabled(false);
+    volumeSlider_->setFocusPolicy(Qt::NoFocus);
+
+    playPauseButton_ = new QPushButton(QStringLiteral("Play"), controlsWidget_);
+    playPauseButton_->setEnabled(false);
+    playPauseButton_->setFocusPolicy(Qt::NoFocus);
+
+    rendererButton_ = new QPushButton(QStringLiteral("SW"), controlsWidget_);
+    rendererButton_->setFixedWidth(46);
+    rendererButton_->setFocusPolicy(Qt::NoFocus);
+
+    fullscreenButton_ = new QPushButton(QStringLiteral("Fullscreen"), controlsWidget_);
+    fullscreenButton_->setFocusPolicy(Qt::NoFocus);
+
+    buttonRow->addWidget(muteButton_);
+    buttonRow->addWidget(volumeSlider_);
+    buttonRow->addStretch(1);
+    buttonRow->addWidget(playPauseButton_);
+    buttonRow->addStretch(1);
+    buttonRow->addWidget(rendererButton_);
+    buttonRow->addWidget(fullscreenButton_);
+
+    outerLayout->addLayout(progressRow);
+    outerLayout->addLayout(buttonRow);
+
+    if (QLayout* layout = ui_->centralwidget->layout()) {
+        static_cast<QVBoxLayout*>(layout)->addWidget(controlsWidget_, 0);
     }
 
-    QObject* root = controlsQml_->rootObject();
-    if (root) {
-        connect(root, SIGNAL(fullscreenClicked()), this, SLOT(onToggleFullscreen()));
-        connect(root, SIGNAL(rendererBadgeClicked()), this, SLOT(onSwitchRenderer()));
+    connect(playPauseButton_, &QPushButton::clicked,
+            controller_, &PlaybackController::togglePause);
+    connect(muteButton_, &QPushButton::clicked, this, [this] {
+        controller_->setMuted(!controller_->isMuted());
+    });
+    connect(fullscreenButton_, &QPushButton::clicked,
+            this, &MainWindow::onToggleFullscreen);
+    connect(rendererButton_, &QPushButton::clicked,
+            this, &MainWindow::onSwitchRenderer);
+    connect(progressSlider_, &QSlider::sliderReleased, this, [this] {
+        if (!progressSlider_ || !progressSlider_->isEnabled()) {
+            return;
+        }
+        controller_->requestSeek(progressSliderSeconds(progressSlider_->value()));
+    });
+    connect(progressSlider_, &QSlider::valueChanged, this, [this](int value) {
+        if (progressSlider_ && progressSlider_->isSliderDown() && currentTimeLabel_) {
+            currentTimeLabel_->setText(formatTime(progressSliderSeconds(value)));
+        }
+    });
+    connect(volumeSlider_, &QSlider::sliderMoved, this, [this](int value) {
+        controller_->setVolume(static_cast<float>(value) / 100.0f);
+    });
+    connect(volumeSlider_, &QSlider::sliderReleased, this, [this] {
+        if (volumeSlider_) {
+            controller_->setVolume(static_cast<float>(volumeSlider_->value()) / 100.0f);
+        }
+    });
+
+    updatePositionControls(controller_->positionSec(), controller_->durationSec());
+    updateVolumeControls(controller_->volume(), controller_->isMuted());
+    updateControlsState();
+}
+
+void MainWindow::updateControlsState()
+{
+    const PlaybackController::State state = controller_->state();
+    const bool isOpen =
+        state != PlaybackController::State::Idle &&
+        state != PlaybackController::State::Opening &&
+        state != PlaybackController::State::Error;
+    const bool canControl = isOpen && state != PlaybackController::State::Seeking;
+    const bool canSeek = canControl && !controller_->isRealtime() && controller_->durationSec() >= 0.0;
+
+    if (progressSlider_) {
+        progressSlider_->setEnabled(canSeek);
+    }
+    if (volumeSlider_) {
+        volumeSlider_->setEnabled(isOpen);
+    }
+    if (muteButton_) {
+        muteButton_->setEnabled(isOpen);
+    }
+    if (playPauseButton_) {
+        playPauseButton_->setEnabled(canControl);
+        playPauseButton_->setText(state == PlaybackController::State::Playing
+                                      ? QStringLiteral("Pause")
+                                      : QStringLiteral("Play"));
+    }
+}
+
+void MainWindow::updatePositionControls(double positionSec, double durationSec)
+{
+    if (currentTimeLabel_) {
+        currentTimeLabel_->setText(formatTime(positionSec));
+    }
+    if (durationLabel_) {
+        durationLabel_->setText(durationSec < 0.0
+                                    ? QStringLiteral("LIVE")
+                                    : formatTime(durationSec));
+    }
+    if (!progressSlider_ || progressSlider_->isSliderDown()) {
+        return;
+    }
+
+    progressSlider_->setMaximum(progressSliderMax(durationSec));
+    progressSlider_->setValue(std::min(progressSliderValue(positionSec), progressSlider_->maximum()));
+}
+
+void MainWindow::updateVolumeControls(float volume, bool muted)
+{
+    if (volumeSlider_ && !volumeSlider_->isSliderDown()) {
+        const int value = static_cast<int>(std::clamp(volume, 0.0f, 1.0f) * 100.0f);
+        volumeSlider_->setValue(value);
+    }
+    if (muteButton_) {
+        muteButton_->setText(muted ? QStringLiteral("Muted") : QStringLiteral("Mute"));
     }
 }
 
@@ -350,4 +562,27 @@ QString MainWindow::stateText(PlaybackController::State s)
     }
 
     return QStringLiteral("Unknown");
+}
+
+QString MainWindow::formatTime(double seconds)
+{
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        seconds = 0.0;
+    }
+
+    const int totalSeconds = static_cast<int>(seconds);
+    const int hours = totalSeconds / 3600;
+    const int minutes = (totalSeconds % 3600) / 60;
+    const int secs = totalSeconds % 60;
+
+    if (hours > 0) {
+        return QStringLiteral("%1:%2:%3")
+            .arg(hours)
+            .arg(minutes, 2, 10, QLatin1Char('0'))
+            .arg(secs, 2, 10, QLatin1Char('0'));
+    }
+
+    return QStringLiteral("%1:%2")
+        .arg(minutes, 2, 10, QLatin1Char('0'))
+        .arg(secs, 2, 10, QLatin1Char('0'));
 }

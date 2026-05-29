@@ -7,12 +7,13 @@
 #include <QString>
 #include <QUrl>
 
-class QQuickWidget;
-class QStackedLayout;
+class QVBoxLayout;
 class QWidget;
 class QCloseEvent;
 class QKeyEvent;
 class QLabel;
+class QPushButton;
+class QSlider;
 
 class VideoRendererBase;
 
@@ -25,20 +26,18 @@ QT_END_NAMESPACE
 /*
  * MainWindow 职责边界：
  *   - 窗口骨架：菜单栏（打开文件、打开 URL、切换渲染器）+ 中央视频区 +
- *     底部控制栏（QML）+ 状态栏（错误信息、当前解码模式）
+ *     底部控制栏（Qt Widgets）+ 状态栏（错误信息、当前解码模式）
  *   - 持有 PlaybackController（数据流编排）和 VideoRendererBase（视频画面）
- *   - 把 QML 控制栏的信号（play/pause/seek/volume）转发给 PlaybackController
- *   - 监听 PlaybackController 的 signal，更新 QML 的进度条 / 时间标签 /
+ *   - 把底部控制栏的信号（play/pause/seek/volume）转发给 PlaybackController
+ *   - 监听 PlaybackController 的 signal，更新进度条 / 时间标签 /
  *     按钮状态
  *
  * 设计说明：
  *   - 中央视频区是一个容器 widget（videoContainer_），实际渲染器作为它的
  *     子 widget 填满。切换软件 / OpenGL 渲染器时，只换内部 widget，外层
  *     布局不变。
- *   - 控制栏走 QML（QQuickWidget 加载 PlayerControls.qml），叠在视频区底部
- *     （由 QStackedLayout 实现"上层透明 overlay"，鼠标移出后渐隐由 QML 端控制）。
- *   - QML 通过 contextProperty "controller" 拿到 PlaybackController 指针，
- *     直接调用 slots / 监听 signals，不再写 Q_PROPERTY 中转。
+ *   - 控制栏是独立的 Qt Widgets 区域，放在视频区下面，不和视频渲染
+ *     widget 抢层级。
  *   - MainWindow 不持有播放业务状态——任何"是否在播放、当前位置"的判断
  *     都向 PlaybackController 询问。
  */
@@ -79,14 +78,18 @@ private:
     void installRenderer(RendererKind kind);
     void removeCurrentRenderer();
 
-    // 加载 QML 控制栏（QQuickWidget），并把 controller_ 注入 root context
-    void setupControlsQml();
+    // 加载底部控制栏，并把控件动作转发给 controller_
+    void setupControlsWidget();
+    void updateControlsState();
+    void updatePositionControls(double positionSec, double durationSec);
+    void updateVolumeControls(float volume, bool muted);
 
     // 把状态栏更新成与 controller_ 当前状态匹配
     void updateStatusBar();
 
     // 状态机文案 / 渲染器名称等小工具
     static QString stateText(PlaybackController::State s);
+    static QString formatTime(double seconds);
 
 private:
     Ui::MainWindow* ui_ = nullptr;
@@ -97,9 +100,17 @@ private:
     RendererKind rendererKind_ = RendererKind::Software;
 
     // ---------- UI 节点 ----------
-    QWidget* videoContainer_ = nullptr;     // 中央：视频 + overlay 控制栏的容器
-    QStackedLayout* overlayLayout_ = nullptr;
-    QQuickWidget* controlsQml_ = nullptr;
+    QWidget* videoContainer_ = nullptr;     // 中央上半部分：只承载视频渲染器
+    QVBoxLayout* videoLayout_ = nullptr;
+    QWidget* controlsWidget_ = nullptr;
+    QSlider* progressSlider_ = nullptr;
+    QSlider* volumeSlider_ = nullptr;
+    QLabel* currentTimeLabel_ = nullptr;
+    QLabel* durationLabel_ = nullptr;
+    QPushButton* playPauseButton_ = nullptr;
+    QPushButton* muteButton_ = nullptr;
+    QPushButton* fullscreenButton_ = nullptr;
+    QPushButton* rendererButton_ = nullptr;
     QLabel* statusLabel_ = nullptr;
 };
 
