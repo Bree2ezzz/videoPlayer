@@ -199,6 +199,7 @@ private:
 
     // seek 流程细分
     void doSeek(double positionSec);
+    double stepBasePositionSec() const;
 
     // 音量应用：把 volume_ * (muted_ ? 0 : 1) 推给 AudioOutput
     void applyVolumeToOutput();

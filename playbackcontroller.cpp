@@ -61,6 +61,14 @@ double frameIntervalFromRate(AVRational rate)
     return 1.0 / 25.0;
 }
 
+double frameStepSeekTolerance(double frameIntervalSec)
+{
+    if (!std::isfinite(frameIntervalSec) || frameIntervalSec <= 0.0) {
+        return 0.001;
+    }
+    return std::clamp(frameIntervalSec * 0.05, 0.0001, 0.005);
+}
+
 } // namespace
 
 PlaybackController::PlaybackController(QObject* parent)
@@ -248,10 +256,12 @@ void PlaybackController::stepForward()
         return;
     }
 
-    const double currentPts = std::max(0.0, renderScheduler_->lastDisplayedPts());
+    const double currentPts = std::max(0.0, stepBasePositionSec());
+    const bool hasPendingTarget = lastSeekTargetSec_.load() >= 0.0;
     const double epsilon = std::max(0.0001, videoFrameIntervalSec_ * 0.1);
+    const double delta = hasPendingTarget ? videoFrameIntervalSec_ : epsilon;
     renderStepAfterSeek_.store(true);
-    doSeek(currentPts + epsilon);
+    doSeek(currentPts + delta);
 }
 
 void PlaybackController::stepBackward()
@@ -261,10 +271,14 @@ void PlaybackController::stepBackward()
         return;
     }
 
-    const double currentPts = std::max(0.0, renderScheduler_->lastDisplayedPts());
+    const double currentPts = std::max(0.0, stepBasePositionSec());
+    const bool hasPendingTarget = lastSeekTargetSec_.load() >= 0.0;
     const double epsilon = std::max(0.0001, videoFrameIntervalSec_ * 0.1);
+    const double delta = hasPendingTarget
+                             ? videoFrameIntervalSec_
+                             : videoFrameIntervalSec_ + epsilon;
     renderStepAfterSeek_.store(true);
-    doSeek(std::max(0.0, currentPts - videoFrameIntervalSec_ - epsilon));
+    doSeek(std::max(0.0, currentPts - delta));
 }
 
 void PlaybackController::setVolume(float volume)
@@ -354,7 +368,9 @@ double PlaybackController::positionSec() const
 
     if (state() == State::Paused && hasVideo_ && renderScheduler_) {
         const double pts = renderScheduler_->lastDisplayedPts();
-        if (seekTarget >= 0.0 && pts < seekTarget - 0.1) {
+        const double tolerance = frameStepSeekTolerance(videoFrameIntervalSec_);
+        if (seekTarget >= 0.0 &&
+            (!std::isfinite(pts) || pts + tolerance < seekTarget)) {
             return seekTarget;
         }
         if (seekTarget >= 0.0) {
@@ -694,6 +710,16 @@ void PlaybackController::doSeek(double positionSec)
     }
 
     onPositionTick();
+}
+
+double PlaybackController::stepBasePositionSec() const
+{
+    const double position = positionSec();
+    const double pendingTarget = lastSeekTargetSec_.load();
+    if (pendingTarget >= 0.0 && std::isfinite(pendingTarget)) {
+        return pendingTarget;
+    }
+    return position;
 }
 
 void PlaybackController::applyVolumeToOutput()
