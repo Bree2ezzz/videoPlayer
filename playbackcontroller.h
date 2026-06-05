@@ -112,6 +112,10 @@ public:
     // 实时流（isRealtime() 为 true）忽略本次调用，并通过 errorOccurred 提示。
     Q_INVOKABLE void seek(double positionSec);
 
+    // 暂停态逐帧步进。内部复用精确 seek 链路，并在 seek 后渲染一帧预览。
+    Q_INVOKABLE void stepForward();
+    Q_INVOKABLE void stepBackward();
+
     // ---------- 音量 ----------
     // [0.0, 1.0]，越界会被 clamp。即时生效。
     Q_INVOKABLE void setVolume(float volume);
@@ -120,11 +124,16 @@ public:
     Q_INVOKABLE void setMuted(bool muted);
     Q_INVOKABLE bool isMuted() const;
 
+    Q_INVOKABLE void setPlaybackRate(float rate);
+    Q_INVOKABLE float playbackRate() const;
+
     // ---------- 状态查询 ----------
     Q_INVOKABLE State state() const;
     Q_INVOKABLE bool isOpen() const;        // 非 Idle / Error / Opening
     Q_INVOKABLE bool isPlaying() const;     // 仅 Playing
     Q_INVOKABLE bool isRealtime() const;    // 网络流，UI 用来禁用进度条/seek
+    Q_INVOKABLE bool hasVideo() const;
+    Q_INVOKABLE bool hasAudio() const;
 
     // 当前播放位置（秒）。优先取 audioClock；无音轨时取视频 lastDisplayedPts。
     Q_INVOKABLE double positionSec() const;
@@ -154,6 +163,7 @@ signals:
     // 音量 / 静音变化（其他控件可同步显示）
     void volumeChanged(float volume);
     void mutedChanged(bool muted);
+    void playbackRateChanged(float rate);
 
     // seek 完成（state 已经回到 seek 前的 Playing/Paused）
     void seekFinished();
@@ -192,6 +202,7 @@ private:
 
     // 音量应用：把 volume_ * (muted_ ? 0 : 1) 推给 AudioOutput
     void applyVolumeToOutput();
+    void applyPlaybackRateToOutputs();
 
     // 把模块的 std::function 回调统一中转为 invokeMethod
     void installModuleCallbacks();
@@ -224,6 +235,7 @@ private:
     bool hasVideo_ = false;
     bool videoEofReceived_ = true;
     bool audioEofReceived_ = true;
+    double videoFrameIntervalSec_ = 1.0 / 25.0;
 
     // ---------- 状态 ----------
     std::atomic<State> state_{State::Idle};
@@ -238,6 +250,8 @@ private:
     // ---------- 音量 ----------
     std::atomic<float> volume_{1.0f};
     std::atomic_bool muted_{false};
+    std::atomic<float> playbackRate_{1.0f};
+    std::atomic_bool renderStepAfterSeek_{false};
 
     // ---------- 进度推送 ----------
     QTimer* positionTimer_ = nullptr;

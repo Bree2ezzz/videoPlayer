@@ -49,6 +49,18 @@ double clampSeekPosition(double positionSec, double durationSec)
     return std::max(0.0, positionSec);
 }
 
+double frameIntervalFromRate(AVRational rate)
+{
+    if (rate.num > 0 && rate.den > 0) {
+        const double fps =
+            static_cast<double>(rate.num) / static_cast<double>(rate.den);
+        if (std::isfinite(fps) && fps > 0.0 && fps < 1000.0) {
+            return 1.0 / fps;
+        }
+    }
+    return 1.0 / 25.0;
+}
+
 } // namespace
 
 PlaybackController::PlaybackController(QObject* parent)
@@ -120,6 +132,8 @@ void PlaybackController::close()
     audioEofReceived_ = true;
     preSeekState_ = State::Paused;
     lastSeekTargetSec_.store(-1.0);
+    renderStepAfterSeek_.store(false);
+    videoFrameIntervalSec_ = 1.0 / 25.0;
 
     transitionTo(State::Idle);
 }
@@ -227,6 +241,32 @@ void PlaybackController::seek(double positionSec)
     doSeek(positionSec);
 }
 
+void PlaybackController::stepForward()
+{
+    if (state() != State::Paused || !hasVideo_ || !renderScheduler_ ||
+        realtime_ || durationSec_ < 0.0) {
+        return;
+    }
+
+    const double currentPts = std::max(0.0, renderScheduler_->lastDisplayedPts());
+    const double epsilon = std::max(0.0001, videoFrameIntervalSec_ * 0.1);
+    renderStepAfterSeek_.store(true);
+    doSeek(currentPts + epsilon);
+}
+
+void PlaybackController::stepBackward()
+{
+    if (state() != State::Paused || !hasVideo_ || !renderScheduler_ ||
+        realtime_ || durationSec_ < 0.0) {
+        return;
+    }
+
+    const double currentPts = std::max(0.0, renderScheduler_->lastDisplayedPts());
+    const double epsilon = std::max(0.0001, videoFrameIntervalSec_ * 0.1);
+    renderStepAfterSeek_.store(true);
+    doSeek(std::max(0.0, currentPts - videoFrameIntervalSec_ - epsilon));
+}
+
 void PlaybackController::setVolume(float volume)
 {
     const float clamped = std::clamp(volume, 0.0f, 1.0f);
@@ -258,6 +298,22 @@ bool PlaybackController::isMuted() const
     return muted_.load();
 }
 
+void PlaybackController::setPlaybackRate(float rate)
+{
+    const float clamped = std::clamp(rate, 0.5f, 2.0f);
+    const float old = playbackRate_.exchange(clamped);
+    applyPlaybackRateToOutputs();
+
+    if (std::fabs(old - clamped) >= 0.0001f) {
+        emit playbackRateChanged(clamped);
+    }
+}
+
+float PlaybackController::playbackRate() const
+{
+    return playbackRate_.load();
+}
+
 PlaybackController::State PlaybackController::state() const
 {
     return state_.load();
@@ -279,11 +335,32 @@ bool PlaybackController::isRealtime() const
     return realtime_;
 }
 
+bool PlaybackController::hasVideo() const
+{
+    return hasVideo_;
+}
+
+bool PlaybackController::hasAudio() const
+{
+    return hasAudio_;
+}
+
 double PlaybackController::positionSec() const
 {
     const double seekTarget = lastSeekTargetSec_.load();
     if (seekTarget >= 0.0 && state() == State::Seeking) {
         return seekTarget;
+    }
+
+    if (state() == State::Paused && hasVideo_ && renderScheduler_) {
+        const double pts = renderScheduler_->lastDisplayedPts();
+        if (seekTarget >= 0.0 && pts < seekTarget - 0.1) {
+            return seekTarget;
+        }
+        if (seekTarget >= 0.0) {
+            lastSeekTargetSec_.store(-1.0);
+        }
+        return std::max(0.0, pts);
     }
 
     if (hasAudio_ && audioOutput_) {
@@ -409,6 +486,7 @@ bool PlaybackController::buildPipeline(const QUrl& url)
     audioEofReceived_ = !hasAudio_;
     installModuleCallbacks();
     applyVolumeToOutput();
+    applyPlaybackRateToOutputs();
     return true;
 }
 
@@ -458,6 +536,7 @@ bool PlaybackController::openDemuxer(const QUrl& url)
     videoStreamIndex_ = demuxer_->bestVideoStreamIndex();
     audioStreamIndex_ = demuxer_->bestAudioStreamIndex();
     realtime_ = demuxer_->isRealtime();
+    videoFrameIntervalSec_ = 1.0 / 25.0;
 
     const int64_t durationUs = demuxer_->durationUs();
     durationSec_ = durationUs >= 0
@@ -578,6 +657,7 @@ bool PlaybackController::wireScheduler()
     renderScheduler_->setRenderer(renderer_);
     renderScheduler_->setTimeBase(stream->time_base);
     renderScheduler_->setSourceFrameRate(stream->avg_frame_rate);
+    videoFrameIntervalSec_ = frameIntervalFromRate(stream->avg_frame_rate);
     renderScheduler_->setSync(avSync_.get());
     renderScheduler_->setMode(hasAudio_ ? RenderScheduler::Mode::ClockSync
                                         : RenderScheduler::Mode::SourceFps);
@@ -620,6 +700,17 @@ void PlaybackController::applyVolumeToOutput()
 {
     if (audioOutput_) {
         audioOutput_->setVolume(muted_.load() ? 0.0f : volume_.load());
+    }
+}
+
+void PlaybackController::applyPlaybackRateToOutputs()
+{
+    const float rate = playbackRate_.load();
+    if (audioOutput_) {
+        audioOutput_->setPlaybackRate(rate);
+    }
+    if (renderScheduler_) {
+        renderScheduler_->setPlaybackRate(rate);
     }
 }
 
@@ -711,6 +802,11 @@ void PlaybackController::installModuleCallbacks()
                         }
                         if (guard->state() == PlaybackController::State::Seeking) {
                             guard->transitionTo(guard->preSeekState_);
+                        }
+                        if (guard->renderStepAfterSeek_.exchange(false) &&
+                            guard->state() == PlaybackController::State::Paused &&
+                            guard->renderScheduler_) {
+                            guard->renderScheduler_->requestStepForward();
                         }
                         emit guard->seekFinished();
                         guard->onPositionTick();

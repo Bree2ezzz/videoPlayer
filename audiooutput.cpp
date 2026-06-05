@@ -35,6 +35,13 @@ int sdlErrorCode()
     return AVERROR_EXTERNAL;
 }
 
+int scaledOutputSampleRate(int deviceSampleRate, float playbackRate)
+{
+    const float rate = std::clamp(playbackRate, 0.5f, 2.0f);
+    const double scaled = static_cast<double>(deviceSampleRate) / rate;
+    return std::max(1, static_cast<int>(std::lround(scaled)));
+}
+
 } // namespace
 
 AudioOutput::AudioOutput() = default;
@@ -153,6 +160,7 @@ void AudioOutput::close()
         if (swrCtx_) {
             swr_free(&swrCtx_);
         }
+        swrPlaybackRate_ = 1.0f;
         resampleBuffer_.clear();
         resampleBufferSize_ = 0;
         resampleBufferOffset_ = 0;
@@ -296,6 +304,35 @@ float AudioOutput::volume() const
     return volume_.load();
 }
 
+void AudioOutput::setPlaybackRate(float rate)
+{
+    const float clamped = std::clamp(rate, 0.5f, 2.0f);
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    const float old = playbackRate_.load();
+    if (std::fabs(old - clamped) < 0.0001f) {
+        return;
+    }
+
+    playbackRate_.store(clamped);
+    resampleBufferSize_ = 0;
+    resampleBufferOffset_ = 0;
+    if (swrCtx_) {
+        swr_free(&swrCtx_);
+    }
+    swrPlaybackRate_ = 0.0f;
+
+    if (device_) {
+        SDL_ClearQueuedAudio(device_);
+    }
+
+    updateAudioClock(audioClock_.load());
+}
+
+float AudioOutput::playbackRate() const
+{
+    return playbackRate_.load();
+}
+
 double AudioOutput::audioClock() const
 {
     return audioClock_.load();
@@ -312,7 +349,8 @@ double AudioOutput::audioClockDrift() const
     // drift 会持续累积，导致 masterClock 超前真实播放位置。限制 drift 上限
     // 防止 AVSync 算法误判视频"落后"而快速跳帧。
     constexpr double kMaxDrift = 0.1;
-    return std::min(drift, kMaxDrift);
+    const double mediaDrift = drift * std::clamp(playbackRate_.load(), 0.5f, 2.0f);
+    return std::min(mediaDrift, kMaxDrift);
 }
 
 bool AudioOutput::isOpen() const
@@ -390,16 +428,18 @@ void AudioOutput::fillStream(uint8_t* stream, int len)
         const int pendingBytes = device_ ? static_cast<int>(SDL_GetQueuedAudioSize(device_)) : 0;
         const double bufferedSec =
             static_cast<double>(pendingBytes + callbackBufferBytes_) / bytesPerSecond_;
+        const double rate = std::clamp(playbackRate_.load(), 0.5f, 2.0f);
         const double pts =
             currentFramePtsSec_ +
-            static_cast<double>(consumedSamples) / actualParams_.sampleRate -
-            bufferedSec;
+            static_cast<double>(consumedSamples) / actualParams_.sampleRate * rate -
+            bufferedSec * rate;
         // 高频路径，节流：每 50 次回调（约 1s）打一次
         static thread_local int s_logCounter = 0;
         if ((++s_logCounter % 50) == 0) {
             VP_LOG_DEBUG() << "fillStream pts=" << pts
                            << " currentFramePts=" << currentFramePtsSec_
                            << " bufferedSec=" << bufferedSec
+                           << " rate=" << rate
                            << " prevAudioClock=" << audioClock_.load();
         }
         updateAudioClock(pts);
@@ -588,10 +628,12 @@ int AudioOutput::ensureSwrContextLocked(const AVFrame* frame)
         return ret;
     }
 
+    const float rate = std::clamp(playbackRate_.load(), 0.5f, 2.0f);
     const bool sameSource =
         swrCtx_ &&
         srcSampleFormat_ == frameFormat &&
         srcSampleRate_ == frameSampleRate &&
+        std::fabs(swrPlaybackRate_ - rate) < 0.0001f &&
         av_channel_layout_compare(&srcChLayout_, &frameLayout) == 0;
 
     if (sameSource) {
@@ -614,14 +656,17 @@ int AudioOutput::ensureSwrContextLocked(const AVFrame* frame)
 
     srcSampleFormat_ = frameFormat;
     srcSampleRate_ = frameSampleRate;
+    swrPlaybackRate_ = rate;
 
     AVChannelLayout dstLayout{};
     av_channel_layout_default(&dstLayout, actualParams_.channels);
+    const int outputSampleRate =
+        scaledOutputSampleRate(actualParams_.sampleRate, rate);
     //格式转换协议   2. 3. 4.希望转换成什么样子去给到声卡  5. 6. 7.输入的音频长什么样
     ret = swr_alloc_set_opts2(&swrCtx_,
                               &dstLayout,
                               actualParams_.sampleFormat,
-                              actualParams_.sampleRate,
+                              outputSampleRate,
                               &srcChLayout_,
                               srcSampleFormat_,
                               srcSampleRate_,

@@ -99,6 +99,9 @@ public:
     void pause(bool paused);
     bool isPaused() const;
 
+    // 暂停态下请求渲染下一帧。实际 pop/render 仍在 scheduleLoop 线程执行。
+    void requestStepForward();
+
     // 清除内部时序状态（frameTimer_、上一帧 pts 等）。
     // 用于 seek 后让调度器重新对齐时钟。不清 FrameQueue 本身。
     void flush();
@@ -111,6 +114,10 @@ public:
     bool isRunning() const;
     // 最近一帧显示的 pts（秒）。供上层做进度查询的次要参考（音频时钟更准）
     double lastDisplayedPts() const;
+    double sourceFrameIntervalSec() const;
+
+    void setPlaybackRate(float rate);
+    float playbackRate() const;
 
     // ---------- 回调 ----------
     // 可在运行期替换；内部会快照 std::function 后再调用，避免回调里重入死锁。
@@ -150,6 +157,7 @@ private:
     std::atomic<int> timeBaseDen_{1};
     std::atomic<int> frameRateNum_{0};
     std::atomic<int> frameRateDen_{1};
+    std::atomic<float> playbackRate_{1.0f};
     // SourceFps 模式默认帧率（frameRate 无效时使用）
     static constexpr double kFallbackFps = 25.0;
 
@@ -170,6 +178,7 @@ private:
     std::atomic_bool started_{false};
     std::atomic_bool paused_{false};
     std::atomic_bool flushRequested_{false};
+    std::atomic_bool stepForwardRequested_{false};
     std::atomic_bool eofReported_{false};
     std::atomic<double> seekTargetPtsSec_{-1.0};
     std::atomic<int> seekSerial_{-1};

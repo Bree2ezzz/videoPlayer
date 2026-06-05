@@ -58,6 +58,11 @@ double progressSliderSeconds(int value)
     return static_cast<double>(value) / kProgressSliderScale;
 }
 
+QString playbackRateText(float rate)
+{
+    return QStringLiteral("%1x").arg(static_cast<double>(rate), 0, 'g', 3);
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -135,6 +140,8 @@ MainWindow::MainWindow(QWidget* parent)
             this, [this](bool muted) {
                 updateVolumeControls(controller_->volume(), muted);
             });
+    connect(controller_, &PlaybackController::playbackRateChanged,
+            this, &MainWindow::updatePlaybackRateControl);
 
     statusLabel_ = new QLabel(statusBar());
     statusLabel_->setMinimumWidth(260);
@@ -197,6 +204,14 @@ void MainWindow::keyPressEvent(QKeyEvent* event)
         return;
     case Qt::Key_M:
         controller_->setMuted(!controller_->isMuted());
+        event->accept();
+        return;
+    case Qt::Key_Comma:
+        controller_->stepBackward();
+        event->accept();
+        return;
+    case Qt::Key_Period:
+        controller_->stepForward();
         event->accept();
         return;
     case Qt::Key_F:
@@ -410,6 +425,29 @@ void MainWindow::setupControlsWidget()
     playPauseButton_->setEnabled(false);
     playPauseButton_->setFocusPolicy(Qt::NoFocus);
 
+    stepBackwardButton_ = new QPushButton(QStringLiteral("-1帧"), controlsWidget_);
+    stepBackwardButton_->setFixedWidth(52);
+    stepBackwardButton_->setEnabled(false);
+    stepBackwardButton_->setFocusPolicy(Qt::NoFocus);
+
+    stepForwardButton_ = new QPushButton(QStringLiteral("+1帧"), controlsWidget_);
+    stepForwardButton_->setFixedWidth(52);
+    stepForwardButton_->setEnabled(false);
+    stepForwardButton_->setFocusPolicy(Qt::NoFocus);
+
+    speedButton_ = new QPushButton(playbackRateText(controller_->playbackRate()), controlsWidget_);
+    speedButton_->setFixedWidth(58);
+    speedButton_->setFocusPolicy(Qt::NoFocus);
+    speedMenu_ = new QMenu(speedButton_);
+    const float speeds[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+    for (const float speed : speeds) {
+        QAction* action = speedMenu_->addAction(playbackRateText(speed));
+        connect(action, &QAction::triggered, this, [this, speed] {
+            controller_->setPlaybackRate(speed);
+        });
+    }
+    speedButton_->setMenu(speedMenu_);
+
     rendererButton_ = new QPushButton(QStringLiteral("SW"), controlsWidget_);
     rendererButton_->setFixedWidth(46);
     rendererButton_->setFocusPolicy(Qt::NoFocus);
@@ -420,8 +458,11 @@ void MainWindow::setupControlsWidget()
     buttonRow->addWidget(muteButton_);
     buttonRow->addWidget(volumeSlider_);
     buttonRow->addStretch(1);
+    buttonRow->addWidget(stepBackwardButton_);
     buttonRow->addWidget(playPauseButton_);
+    buttonRow->addWidget(stepForwardButton_);
     buttonRow->addStretch(1);
+    buttonRow->addWidget(speedButton_);
     buttonRow->addWidget(rendererButton_);
     buttonRow->addWidget(fullscreenButton_);
 
@@ -434,6 +475,10 @@ void MainWindow::setupControlsWidget()
 
     connect(playPauseButton_, &QPushButton::clicked,
             controller_, &PlaybackController::togglePause);
+    connect(stepBackwardButton_, &QPushButton::clicked,
+            controller_, &PlaybackController::stepBackward);
+    connect(stepForwardButton_, &QPushButton::clicked,
+            controller_, &PlaybackController::stepForward);
     connect(muteButton_, &QPushButton::clicked, this, [this] {
         controller_->setMuted(!controller_->isMuted());
     });
@@ -463,6 +508,7 @@ void MainWindow::setupControlsWidget()
 
     updatePositionControls(controller_->positionSec(), controller_->durationSec());
     updateVolumeControls(controller_->volume(), controller_->isMuted());
+    updatePlaybackRateControl(controller_->playbackRate());
     updateControlsState();
 }
 
@@ -475,6 +521,11 @@ void MainWindow::updateControlsState()
         state != PlaybackController::State::Error;
     const bool canControl = isOpen && state != PlaybackController::State::Seeking;
     const bool canSeek = canControl && !controller_->isRealtime() && controller_->durationSec() >= 0.0;
+    const bool canStep =
+        state == PlaybackController::State::Paused &&
+        controller_->hasVideo() &&
+        !controller_->isRealtime() &&
+        controller_->durationSec() >= 0.0;
 
     if (progressSlider_) {
         progressSlider_->setEnabled(canSeek);
@@ -490,6 +541,15 @@ void MainWindow::updateControlsState()
         playPauseButton_->setText(state == PlaybackController::State::Playing
                                       ? QStringLiteral("Pause")
                                       : QStringLiteral("Play"));
+    }
+    if (stepBackwardButton_) {
+        stepBackwardButton_->setEnabled(canStep);
+    }
+    if (stepForwardButton_) {
+        stepForwardButton_->setEnabled(canStep);
+    }
+    if (speedButton_) {
+        speedButton_->setEnabled(true);
     }
 }
 
@@ -519,6 +579,13 @@ void MainWindow::updateVolumeControls(float volume, bool muted)
     }
     if (muteButton_) {
         muteButton_->setText(muted ? QStringLiteral("Muted") : QStringLiteral("Mute"));
+    }
+}
+
+void MainWindow::updatePlaybackRateControl(float rate)
+{
+    if (speedButton_) {
+        speedButton_->setText(playbackRateText(rate));
     }
 }
 

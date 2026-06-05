@@ -114,6 +114,10 @@ public:
     void setVolume(float volume);
     float volume() const;
 
+    // 基础变速播放：通过重采样比例实现变速变调。
+    void setPlaybackRate(float rate);
+    float playbackRate() const;
+
     // ---------- 同步接口（供 AVSync 使用） ----------
     // 当前音频时钟（秒）。精确定义：下一刻扬声器将要发出的声音对应的 pts。
     // 实现上 = 最近 pop 出的 frame 的 pts + 该 frame 已消耗的采样数/采样率
@@ -171,6 +175,7 @@ private:
 
     // ---------- 重采样 ----------
     SwrContext* swrCtx_ = nullptr;
+    float swrPlaybackRate_ = 1.0f;      // swrCtx_ 创建时使用的播放速率
     std::vector<uint8_t> resampleBuffer_; // 一帧重采样输出的临时缓冲
     int resampleBufferSize_ = 0;          // 缓冲中可用字节数
     int resampleBufferOffset_ = 0;        // 已经被回调消费的字节数
@@ -196,6 +201,7 @@ private:
     std::atomic_bool running_{false};
     std::atomic_bool paused_{false};
     std::atomic<float> volume_{1.0f};
+    std::atomic<float> playbackRate_{1.0f};
 
     // audioClock_ 用原子存储以便 AVSync 在其他线程无锁读取
     std::atomic<double> audioClock_{0.0};

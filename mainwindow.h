@@ -12,6 +12,7 @@ class QWidget;
 class QCloseEvent;
 class QKeyEvent;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QSlider;
 
@@ -83,6 +84,7 @@ private:
     void updateControlsState();
     void updatePositionControls(double positionSec, double durationSec);
     void updateVolumeControls(float volume, bool muted);
+    void updatePlaybackRateControl(float rate);
 
     // 把状态栏更新成与 controller_ 当前状态匹配
     void updateStatusBar();
@@ -107,8 +109,12 @@ private:
     QSlider* volumeSlider_ = nullptr;
     QLabel* currentTimeLabel_ = nullptr;
     QLabel* durationLabel_ = nullptr;
+    QPushButton* stepBackwardButton_ = nullptr;
     QPushButton* playPauseButton_ = nullptr;
+    QPushButton* stepForwardButton_ = nullptr;
     QPushButton* muteButton_ = nullptr;
+    QPushButton* speedButton_ = nullptr;
+    QMenu* speedMenu_ = nullptr;
     QPushButton* fullscreenButton_ = nullptr;
     QPushButton* rendererButton_ = nullptr;
     QLabel* statusLabel_ = nullptr;

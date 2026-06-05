@@ -150,6 +150,7 @@ int RenderScheduler::start()
     lastPtsSec_ = quietNaN();
     frameTimer_ = steadySeconds();
     timingSerial_ = -1;
+    stepForwardRequested_.store(false);
     seekTargetPtsSec_.store(-1.0);
     seekSerial_.store(-1);
 
@@ -182,6 +183,15 @@ void RenderScheduler::pause(bool paused)
 bool RenderScheduler::isPaused() const
 {
     return paused_.load();
+}
+
+void RenderScheduler::requestStepForward()
+{
+    if (!started_.load() || abort_.load()) {
+        return;
+    }
+
+    stepForwardRequested_.store(true);
 }
 
 void RenderScheduler::flush()
@@ -219,6 +229,21 @@ double RenderScheduler::lastDisplayedPts() const
     return lastDisplayedPts_.load();
 }
 
+double RenderScheduler::sourceFrameIntervalSec() const
+{
+    return sourceFrameInterval(frameRateNum_.load(), frameRateDen_.load());
+}
+
+void RenderScheduler::setPlaybackRate(float rate)
+{
+    playbackRate_.store(std::clamp(rate, 0.5f, 2.0f));
+}
+
+float RenderScheduler::playbackRate() const
+{
+    return playbackRate_.load();
+}
+
 void RenderScheduler::setEofCallback(EofCallback cb)
 {
     std::lock_guard<std::mutex> lock(callbackMutex_);
@@ -237,17 +262,18 @@ void RenderScheduler::scheduleLoop()
     lastPtsSec_ = quietNaN();
 
     while (!abort_.load()) {
-        if (paused_.load()) {
-            interruptibleSleep(0.01, abort_);
-            frameTimer_ = steadySeconds();
-            continue;
-        }
-
         if (flushRequested_.exchange(false)) {
             lastPtsSec_ = quietNaN();
             frameTimer_ = steadySeconds();
             lastDisplayedPts_.store(0.0);
             timingSerial_ = -1;
+        }
+
+        const bool stepping = paused_.load() && stepForwardRequested_.load();
+        if (paused_.load() && !stepping) {
+            interruptibleSleep(0.01, abort_);
+            frameTimer_ = steadySeconds();
+            continue;
         }
 
         FrameQueue* queue = frameQueueSnapshot();
@@ -265,6 +291,7 @@ void RenderScheduler::scheduleLoop()
             continue;
         }
         if (ret == FrameQueue::EndOfStream) {
+            stepForwardRequested_.store(false);
             EofCallback cb;
             if (!eofReported_.exchange(true)) {
                 std::lock_guard<std::mutex> lock(callbackMutex_);
@@ -327,7 +354,7 @@ void RenderScheduler::scheduleLoop()
             seekSerial_.store(-1);
         }
 
-        if (mode_.load() == Mode::ClockSync && std::isfinite(lastPtsSec_)) {
+        if (!stepping && mode_.load() == Mode::ClockSync && std::isfinite(lastPtsSec_)) {
             AVSync* sync = syncSnapshot();
             if (sync && sync->isVideoLate(pts, lastPtsSec_) && queue->size() > 0) {
                 VP_LOG_DEBUG() << "drop late video frame serial=" << frameSerial
@@ -339,8 +366,12 @@ void RenderScheduler::scheduleLoop()
         }
 
         const bool firstScheduledFrame = !std::isfinite(lastPtsSec_);
-        const double delay = computeDelaySec(pts, lastPtsSec_);
-        frameTimer_ += delay;
+        const double delay = stepping ? 0.0 : computeDelaySec(pts, lastPtsSec_);
+        if (stepping) {
+            frameTimer_ = steadySeconds();
+        } else {
+            frameTimer_ += delay;
+        }
 
         // 节流日志：每 30 帧（约 1s）打一次同步参数，方便观察 seek 后节奏
         static thread_local int s_logCounter = 0;
@@ -356,7 +387,7 @@ void RenderScheduler::scheduleLoop()
         }
 
         const double now = steadySeconds();
-        double waitSec = frameTimer_ - now;
+        double waitSec = stepping ? 0.0 : frameTimer_ - now;
         constexpr double kMaxFrameDelay = 0.1;
         if (waitSec < -kMaxFrameDelay) {
             frameTimer_ = now;
@@ -396,6 +427,9 @@ void RenderScheduler::scheduleLoop()
         renderer->renderFrame(frame);
         lastPtsSec_ = pts;
         lastDisplayedPts_.store(pts);
+        if (stepping) {
+            stepForwardRequested_.store(false);
+        }
         av_frame_free(&frame);
     }
 
@@ -408,15 +442,16 @@ double RenderScheduler::computeDelaySec(double framePtsSec, double lastFramePtsS
         return 0.0;
     }
 
+    const double rate = std::clamp(playbackRate_.load(), 0.5f, 2.0f);
     const double fallbackDelay = sourceFrameInterval(
-        frameRateNum_.load(), frameRateDen_.load());
+        frameRateNum_.load(), frameRateDen_.load()) / rate;
 
     if (mode_.load() == Mode::ClockSync) {
         AVSync* sync = syncSnapshot();
         if (sync) {
             const double delay =
                 sync->computeVideoTargetDelay(framePtsSec, lastFramePtsSec);
-            return std::isfinite(delay) && delay >= 0.0 ? delay : 0.0;
+            return std::isfinite(delay) && delay >= 0.0 ? delay / rate : 0.0;
         }
     }
 
