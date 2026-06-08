@@ -42,8 +42,14 @@ struct NetworkOptions {
 
     // ---------- RTMP 专属 ----------
     // RTMP live mode：true 时 ffmpeg 会按低延迟方式读流；点播 false。
-    // 翻译为 "rtmp_live" = "live" / "any"
+    // rtmp / rtmps 都会翻译为 "rtmp_live" = "live" / "any"。
     bool rtmpLive = true;
+
+    // ---------- HTTP / HTTPS / HLS / HTTP-FLV ----------
+    // 让 FFmpeg 的 HTTP 协议层在网络断开、EOF 或直播分片读取失败时尝试重连。
+    // 对 HLS(m3u8)、HTTP-FLV、HTTP MP4 直链都适用；播放器上层仍有整体超时兜底。
+    bool httpReconnect = true;
+    int httpReconnectDelayMaxSec = 5;
 
     // ---------- 通用网络 ----------
     // 接收 socket buffer 大小（字节）。0 表示不设置，沿用系统默认。

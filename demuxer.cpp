@@ -45,6 +45,7 @@ bool isRealtimeScheme(const QUrl& url)
     const QString scheme = url.scheme().toLower();
     return scheme == "rtsp" ||
            scheme == "rtmp" ||
+           scheme == "rtmps" ||
            scheme == "rtp" ||
            scheme == "udp";
 }
@@ -52,6 +53,18 @@ bool isRealtimeScheme(const QUrl& url)
 bool isRtspScheme(const QUrl& url)
 {
     return url.scheme().toLower() == "rtsp";
+}
+
+bool isRtmpScheme(const QUrl& url)
+{
+    const QString scheme = url.scheme().toLower();
+    return scheme == "rtmp" || scheme == "rtmps";
+}
+
+bool isHttpScheme(const QUrl& url)
+{
+    const QString scheme = url.scheme().toLower();
+    return scheme == "http" || scheme == "https";
 }
 
 int64_t steadyMicroseconds()
@@ -107,8 +120,16 @@ AVDictionary* buildInputOptions(const QUrl& url, const NetworkOptions& options)
         setDictInt(&dict, "timeout", options.rtspStimeoutUs);
     }
 
-    if (url.scheme().toLower() == "rtmp") {
+    if (isRtmpScheme(url)) {
         av_dict_set(&dict, "rtmp_live", options.rtmpLive ? "live" : "any", 0);
+    }
+
+    if (isHttpScheme(url) && options.httpReconnect) {
+        av_dict_set(&dict, "reconnect", "1", 0);
+        av_dict_set(&dict, "reconnect_streamed", "1", 0);
+        av_dict_set(&dict, "reconnect_at_eof", "1", 0);
+        setDictInt(&dict, "reconnect_delay_max",
+                   options.httpReconnectDelayMaxSec);
     }
 
     return dict;

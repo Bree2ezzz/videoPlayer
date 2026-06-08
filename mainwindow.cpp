@@ -252,7 +252,7 @@ void MainWindow::onOpenUrl()
     const QString text = QInputDialog::getText(
         this,
         QStringLiteral("Open URL"),
-        QStringLiteral("URL:"),
+        QStringLiteral("URL (RTSP / RTMP / HLS .m3u8 / HTTP-FLV / HTTP MP4):"),
         QLineEdit::Normal,
         QString(),
         &ok);
@@ -287,7 +287,9 @@ void MainWindow::onAbout()
     QMessageBox::about(
         this,
         QStringLiteral("About VideoPlayer"),
-        QStringLiteral("Qt / FFmpeg / SDL video player"));
+        QStringLiteral("Qt / FFmpeg / SDL video player\n\n"
+                       "Network URL support: RTSP, RTMP/RTMPS, HLS(m3u8), "
+                       "HTTP-FLV, and HTTP/HTTPS media files."));
 }
 
 void MainWindow::onStateChanged(PlaybackController::State)

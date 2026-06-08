@@ -79,6 +79,7 @@ bool isNetworkUrl(const QUrl& url)
     const QString scheme = url.scheme().toLower();
     return scheme == "rtsp" ||
            scheme == "rtmp" ||
+           scheme == "rtmps" ||
            scheme == "rtp" ||
            scheme == "udp" ||
            scheme == "http" ||
