@@ -23,7 +23,6 @@ extern "C" {
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
-#include <cstddef>
 #include <utility>
 
 namespace {
@@ -31,12 +30,6 @@ namespace {
 constexpr int kMaxReconnectAttempts = 5;
 constexpr int kInitialReconnectDelayMs = 1000;
 constexpr int kMaxReconnectDelayMs = 8000;
-constexpr size_t kFilePacketQueueSize = 100;
-constexpr size_t kFileFrameQueueSize = 16;
-constexpr size_t kLiveVideoPacketQueueSize = 24;
-constexpr size_t kLiveVideoFrameQueueSize = 3;
-constexpr size_t kLiveAudioPacketQueueSize = 64;
-constexpr size_t kLiveAudioFrameQueueSize = 8;
 
 QString avErrorString(int errCode)
 {
@@ -660,11 +653,8 @@ bool PlaybackController::openDecoders()
             return false;
         }
 
-        videoPacketQueue_ = std::make_unique<PacketQueue>(
-            realtime_ ? kLiveVideoPacketQueueSize : kFilePacketQueueSize);
-        videoFrameQueue_ = std::make_unique<FrameQueue>(
-            realtime_ ? kLiveVideoFrameQueueSize : kFileFrameQueueSize,
-            realtime_);
+        videoPacketQueue_ = std::make_unique<PacketQueue>();
+        videoFrameQueue_ = std::make_unique<FrameQueue>();
         videoDecoder_ = std::make_unique<VideoDecoder>();
 
         int ret = videoDecoder_->open(stream);
@@ -687,10 +677,8 @@ bool PlaybackController::openDecoders()
             return false;
         }
 
-        audioPacketQueue_ = std::make_unique<PacketQueue>(
-            realtime_ ? kLiveAudioPacketQueueSize : kFilePacketQueueSize);
-        audioFrameQueue_ = std::make_unique<FrameQueue>(
-            realtime_ ? kLiveAudioFrameQueueSize : kFileFrameQueueSize);
+        audioPacketQueue_ = std::make_unique<PacketQueue>();
+        audioFrameQueue_ = std::make_unique<FrameQueue>();
         audioDecoder_ = std::make_unique<AudioDecoder>();
 
         int ret = audioDecoder_->open(stream);
@@ -732,10 +720,7 @@ bool PlaybackController::openAudioOutput()
     // currentSerial 判断"这个 frame 是否还属于当前 serial"。
     audioOutput_->setPacketQueue(audioPacketQueue_.get());
 
-    const int ret = audioOutput_->open(stream->codecpar,
-                                      stream->time_base,
-                                      stream->start_time,
-                                      realtime_);
+    const int ret = audioOutput_->open(stream->codecpar, stream->time_base);
     if (ret < 0) {
         enterError(ret, QStringLiteral("AudioOutput open failed: ") + avErrorString(ret));
         return false;
@@ -768,9 +753,7 @@ bool PlaybackController::wireScheduler()
     renderScheduler_->setFrameQueue(videoFrameQueue_.get());
     renderScheduler_->setPacketQueue(videoPacketQueue_.get());
     renderScheduler_->setRenderer(renderer_);
-    renderScheduler_->setTimeBase(stream->time_base,
-                                  stream->start_time,
-                                  realtime_);
+    renderScheduler_->setTimeBase(stream->time_base);
     renderScheduler_->setSourceFrameRate(stream->avg_frame_rate);
     videoFrameIntervalSec_ = frameIntervalFromRate(stream->avg_frame_rate);
     renderScheduler_->setSync(avSync_.get());

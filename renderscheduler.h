@@ -6,15 +6,15 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 
 extern "C" {
-#include <libavutil/avutil.h>
+extern "C" {
 #include <libavutil/rational.h>
+}
 }
 
 class VideoRendererBase;
@@ -70,11 +70,8 @@ public:
     void setPacketQueue(PacketQueue* queue);
     void setRenderer(VideoRendererBase* renderer);
 
-    // 源流的 pts 时基。直播流可开启时间戳归一化，避免 RTSP/RTP
-    // 多轨各自的起始 PTS 偏移直接进入 AVSync。
-    void setTimeBase(AVRational timeBase,
-                     int64_t sourceStartTime = AV_NOPTS_VALUE,
-                     bool normalizeTimestamps = false);
+    // 源流的 pts 时基。来自 AVStream::time_base。start() 前必须设置
+    void setTimeBase(AVRational timeBase);
 
     // 源帧率，用于 SourceFps 模式计算定时间隔。
     // 通常取 AVStream::avg_frame_rate。未知时传 {0,1}，调度器回退到 25fps
@@ -137,7 +134,7 @@ private:
     double computeDelaySec(double framePtsSec, double lastFramePtsSec);
 
     // 根据 timeBase_ 把 AVFrame 的 pts 转成秒；无效 pts 返回 NaN
-    double framePtsToSeconds(const AVFrame* frame);
+    double framePtsToSeconds(const AVFrame* frame) const;
 
     // 快照取值，避免调用方长时间持锁
     FrameQueue* frameQueueSnapshot() const;
@@ -158,8 +155,6 @@ private:
     // ---------- 时基 / 帧率 ----------
     std::atomic<int> timeBaseNum_{0};
     std::atomic<int> timeBaseDen_{1};
-    std::atomic<int64_t> sourceStartTime_{AV_NOPTS_VALUE};
-    std::atomic_bool normalizeTimestamps_{false};
     std::atomic<int> frameRateNum_{0};
     std::atomic<int> frameRateDen_{1};
     std::atomic<float> playbackRate_{1.0f};
@@ -172,7 +167,6 @@ private:
     // ---------- 调度内部状态（仅 scheduleLoop 访问） ----------
     // 上一帧的 pts（秒），用于计算帧间隔
     double lastPtsSec_ = 0.0;
-    int64_t timestampOriginPts_ = AV_NOPTS_VALUE;
     // 下一帧理论应当显示的墙钟时间点（秒，steady_clock）
     double frameTimer_ = 0.0;
     // lastPtsSec_ 所属的 packet epoch。serial 变化时禁止跨 epoch 计算 delay。
