@@ -36,9 +36,9 @@ struct NetworkOptions {
     // 默认 "tcp"：监控场景下绝大多数路由器/网关都拒绝 UDP 直传。
     QString rtspTransport = QStringLiteral("tcp");
 
-    // RTSP 收包超时（微秒）。底层翻译为 "stimeout"。
-    // 5e6 = 5s，监控/嵌入式场景常用值；高延迟链路可调大
-    int64_t rtspStimeoutUs = 5'000'000;
+    // RTSP 收包超时（微秒）。底层翻译为 "stimeout" / "timeout"。
+    // 30e6 = 30s，超过该时间仍无网络响应时交给上层进入重连流程。
+    int64_t rtspStimeoutUs = 30'000'000;
 
     // ---------- RTMP 专属 ----------
     // RTMP live mode：true 时 ffmpeg 会按低延迟方式读流；点播 false。
@@ -52,8 +52,8 @@ struct NetworkOptions {
 
     // 整体连接 / 读取超时（微秒）。底层使用 interrupt_callback 实现。
     // 这是给应用层兜底的硬超时，避开某些 FFmpeg 内部不响应 stimeout 的路径。
-    int64_t openTimeoutUs = 10'000'000;   // 10s
-    int64_t readTimeoutUs = 5'000'000;    // 5s
+    int64_t openTimeoutUs = 30'000'000;   // 30s
+    int64_t readTimeoutUs = 30'000'000;   // 30s
 
     // 起播 buffer：达到该字节数前不开始播放，避免抖动期间画面卡顿。
     // 0 表示禁用起播 buffer（连上即播）。

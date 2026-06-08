@@ -6,6 +6,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 }
+#include "networkoptions.h"
 #include "PacketQueue.h"
 
 #include <atomic>
@@ -56,7 +57,7 @@ public:
     // ---------- 生命周期 ----------
     // 打开输入（本地文件或 RTSP/RTMP URL），探测流信息。
     // 不启动线程、不读取 packet。返回 0 成功，负值为 AVERROR
-    int open(const QUrl& url);
+    int open(const QUrl& url, const NetworkOptions& options = NetworkOptions());
 
     // 关闭输入，释放 fmtCtx_。调用前必须已 stop()
     void close();
@@ -139,6 +140,8 @@ private:
     // ---------- FFmpeg 上下文 ----------
     AVFormatContext* fmtCtx_ = nullptr;
     bool realtime_ = false;
+    std::atomic<int64_t> ioDeadlineUs_{0};
+    std::atomic<int64_t> readTimeoutUs_{0};
 
     // ---------- 订阅表：stream_index -> queue ----------
     // 被 readLoop 和外部线程共享，所有读写都要持 queueMapMutex_

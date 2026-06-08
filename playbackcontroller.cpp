@@ -7,6 +7,7 @@
 #include "decoder.h"
 #include "demuxer.h"
 #include "logging.h"
+#include "networkoptions.h"
 #include "renderscheduler.h"
 
 extern "C" {
@@ -25,6 +26,10 @@ extern "C" {
 #include <utility>
 
 namespace {
+
+constexpr int kMaxReconnectAttempts = 5;
+constexpr int kInitialReconnectDelayMs = 1000;
+constexpr int kMaxReconnectDelayMs = 8000;
 
 QString avErrorString(int errCode)
 {
@@ -69,15 +74,54 @@ double frameStepSeekTolerance(double frameIntervalSec)
     return std::clamp(frameIntervalSec * 0.05, 0.0001, 0.005);
 }
 
+bool isNetworkUrl(const QUrl& url)
+{
+    const QString scheme = url.scheme().toLower();
+    return scheme == "rtsp" ||
+           scheme == "rtmp" ||
+           scheme == "rtp" ||
+           scheme == "udp" ||
+           scheme == "http" ||
+           scheme == "https" ||
+           scheme == "srt";
+}
+
+NetworkOptions networkOptionsForUrl(const QUrl& url)
+{
+    NetworkOptions options;
+    options.networkStream = isNetworkUrl(url);
+    if (url.scheme().toLower() == "rtsp") {
+        options.rtspTransport = QStringLiteral("tcp");
+    }
+    return options;
+}
+
+int reconnectDelayMs(int attempt)
+{
+    if (attempt <= 1) {
+        return kInitialReconnectDelayMs;
+    }
+    int delay = kInitialReconnectDelayMs;
+    for (int i = 1; i < attempt; ++i) {
+        delay = std::min(delay * 2, kMaxReconnectDelayMs);
+    }
+    return delay;
+}
+
 } // namespace
 
 PlaybackController::PlaybackController(QObject* parent)
     : QObject(parent),
-      positionTimer_(new QTimer(this))
+      positionTimer_(new QTimer(this)),
+      reconnectTimer_(new QTimer(this))
 {
     positionTimer_->setInterval(100);
     connect(positionTimer_, &QTimer::timeout,
             this, &PlaybackController::onPositionTick);
+
+    reconnectTimer_->setSingleShot(true);
+    connect(reconnectTimer_, &QTimer::timeout,
+            this, &PlaybackController::performReconnect);
 }
 
 PlaybackController::~PlaybackController()
@@ -111,11 +155,13 @@ void PlaybackController::open(const QUrl& url)
                 return;
             }
 
+            guard->currentUrl_ = url;
             if (!guard->buildPipeline(url)) {
                 return;
             }
 
-            guard->currentUrl_ = url;
+            guard->reconnectAttempts_ = 0;
+            guard->livePausedByStop_ = false;
             guard->transitionTo(State::Ready);
             emit guard->mediaLoaded();
             guard->onPositionTick();
@@ -126,6 +172,9 @@ void PlaybackController::open(const QUrl& url)
 void PlaybackController::close()
 {
     ++openSerial_;
+    if (reconnectTimer_) {
+        reconnectTimer_->stop();
+    }
     positionTimer_->stop();
     teardownPipeline();
 
@@ -142,16 +191,27 @@ void PlaybackController::close()
     lastSeekTargetSec_.store(-1.0);
     renderStepAfterSeek_.store(false);
     videoFrameIntervalSec_ = 1.0 / 25.0;
+    livePausedByStop_ = false;
+    reconnectAttempts_ = 0;
 
     transitionTo(State::Idle);
 }
 
 void PlaybackController::play()
 {
-    const State s = state();
+    State s = state();
     if (s == State::Playing || s == State::Opening || s == State::Seeking ||
         s == State::Idle || s == State::Stopped || s == State::Error) {
         return;
+    }
+
+    if (s == State::Paused && realtime_ && livePausedByStop_) {
+        livePausedByStop_ = false;
+        transitionTo(State::Opening);
+        if (!restartLivePipeline()) {
+            return;
+        }
+        s = State::Ready;
     }
 
     if (s == State::Ready) {
@@ -212,6 +272,16 @@ void PlaybackController::play()
 void PlaybackController::pause()
 {
     if (state() != State::Playing) {
+        return;
+    }
+
+    if (realtime_) {
+        ++openSerial_;
+        livePausedByStop_ = true;
+        positionTimer_->stop();
+        teardownPipeline();
+        transitionTo(State::Paused);
+        onPositionTick();
         return;
     }
 
@@ -436,6 +506,10 @@ void PlaybackController::handleEofFromModule()
         return;
     }
 
+    if (realtime_ && scheduleReconnect(AVERROR_EOF, QStringLiteral("Network stream ended"))) {
+        return;
+    }
+
     positionTimer_->stop();
     transitionTo(State::Stopped);
     emit endOfStream();
@@ -455,6 +529,9 @@ void PlaybackController::handleAudioEofFromModule()
 
 void PlaybackController::handleErrorFromModule(int errCode, const QString& msg)
 {
+    if (scheduleReconnect(errCode, msg)) {
+        return;
+    }
     enterError(errCode, msg);
 }
 
@@ -468,6 +545,10 @@ void PlaybackController::transitionTo(State newState)
 
 void PlaybackController::enterError(int errCode, const QString& msg)
 {
+    if (scheduleReconnect(errCode, msg)) {
+        return;
+    }
+
     if (state() == State::Error) {
         emit errorOccurred(errCode, msg);
         return;
@@ -492,7 +573,8 @@ bool PlaybackController::buildPipeline(const QUrl& url)
         !openAudioOutput() ||
         !wireScheduler()) {
         teardownPipeline();
-        if (state() != State::Error) {
+        const bool reconnectPending = reconnectTimer_ && reconnectTimer_->isActive();
+        if (!reconnectPending && state() != State::Error) {
             transitionTo(State::Idle);
         }
         return false;
@@ -543,7 +625,7 @@ void PlaybackController::teardownPipeline()
 
 bool PlaybackController::openDemuxer(const QUrl& url)
 {
-    const int ret = demuxer_->open(url);
+    const int ret = demuxer_->open(url, networkOptionsForUrl(url));
     if (ret < 0) {
         enterError(ret, QStringLiteral("Demuxer open failed: ") + avErrorString(ret));
         return false;
@@ -720,6 +802,79 @@ double PlaybackController::stepBasePositionSec() const
         return pendingTarget;
     }
     return position;
+}
+
+bool PlaybackController::restartLivePipeline()
+{
+    if (!currentUrl_.isValid() || currentUrl_.isEmpty()) {
+        enterError(AVERROR(EINVAL), QStringLiteral("Invalid live URL"));
+        return false;
+    }
+
+    if (!buildPipeline(currentUrl_)) {
+        return false;
+    }
+
+    reconnectAttempts_ = 0;
+    transitionTo(State::Ready);
+    emit mediaLoaded();
+    onPositionTick();
+    return true;
+}
+
+bool PlaybackController::scheduleReconnect(int errCode, const QString& msg)
+{
+    if (livePausedByStop_ ||
+        !isNetworkUrl(currentUrl_) ||
+        currentUrl_.isEmpty() ||
+        state() == State::Idle ||
+        state() == State::Stopped) {
+        return false;
+    }
+
+    if (reconnectAttempts_ >= kMaxReconnectAttempts) {
+        return false;
+    }
+
+    ++reconnectAttempts_;
+    ++openSerial_;
+    positionTimer_->stop();
+    teardownPipeline();
+    transitionTo(State::Opening);
+
+    const int delayMs = reconnectDelayMs(reconnectAttempts_);
+    emit errorOccurred(
+        errCode,
+        QStringLiteral("%1; reconnecting %2/%3 in %4s")
+            .arg(msg)
+            .arg(reconnectAttempts_)
+            .arg(kMaxReconnectAttempts)
+            .arg(delayMs / 1000.0, 0, 'f', 1));
+
+    if (reconnectTimer_) {
+        reconnectTimer_->start(delayMs);
+    }
+    return true;
+}
+
+void PlaybackController::performReconnect()
+{
+    if (state() != State::Opening ||
+        currentUrl_.isEmpty() ||
+        !isNetworkUrl(currentUrl_)) {
+        return;
+    }
+
+    if (!buildPipeline(currentUrl_)) {
+        return;
+    }
+
+    reconnectAttempts_ = 0;
+    livePausedByStop_ = false;
+    transitionTo(State::Ready);
+    emit mediaLoaded();
+    onPositionTick();
+    play();
 }
 
 void PlaybackController::applyVolumeToOutput()

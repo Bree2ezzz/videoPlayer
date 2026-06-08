@@ -24,6 +24,7 @@ qt_add_executable(videoplayer
     openglrenderer.h openglrenderer.cpp
     avsync.h avsync.cpp
     logging.h logging.cpp
+    networkoptions.h
     PacketQueue.h
     FrameQueue.h
 )

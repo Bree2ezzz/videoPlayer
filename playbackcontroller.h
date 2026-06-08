@@ -201,6 +201,10 @@ private:
     void doSeek(double positionSec);
     double stepBasePositionSec() const;
 
+    bool restartLivePipeline();
+    bool scheduleReconnect(int errCode, const QString& msg);
+    void performReconnect();
+
     // 音量应用：把 volume_ * (muted_ ? 0 : 1) 推给 AudioOutput
     void applyVolumeToOutput();
     void applyPlaybackRateToOutputs();
@@ -253,9 +257,12 @@ private:
     std::atomic_bool muted_{false};
     std::atomic<float> playbackRate_{1.0f};
     std::atomic_bool renderStepAfterSeek_{false};
+    bool livePausedByStop_ = false;
+    int reconnectAttempts_ = 0;
 
     // ---------- 进度推送 ----------
     QTimer* positionTimer_ = nullptr;
+    QTimer* reconnectTimer_ = nullptr;
 
     // ---------- 模块层回调中转所需 ----------
     // 防止子模块回调在对象析构后被触发：模块层只持有弱引用般的 lambda，

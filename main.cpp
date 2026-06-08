@@ -5,10 +5,9 @@
 #include <QLoggingCategory>
 #include <QString>
 #include <QUrl>
-extern "C"{
 extern "C" {
 #include <libavcodec/avcodec.h>
-}
+#include <libavformat/avformat.h>
 }
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
@@ -19,6 +18,7 @@ int main(int argc, char *argv[])
     if (SDL_Init(SDL_INIT_AUDIO) != 0) {
         return 1;
     }
+    avformat_network_init();
 
     // 日志格式：[级别] 文件:行 函数 - 内容
     qSetMessagePattern(
@@ -42,6 +42,7 @@ int main(int argc, char *argv[])
     w.show();
 
     const int ret = a.exec();
+    avformat_network_deinit();
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     SDL_Quit();
     return ret;

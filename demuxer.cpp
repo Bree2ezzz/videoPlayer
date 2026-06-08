@@ -7,12 +7,15 @@
 
 extern "C" {
 #include <libavutil/avutil.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 }
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 namespace {
@@ -46,6 +49,71 @@ bool isRealtimeScheme(const QUrl& url)
            scheme == "udp";
 }
 
+bool isRtspScheme(const QUrl& url)
+{
+    return url.scheme().toLower() == "rtsp";
+}
+
+int64_t steadyMicroseconds()
+{
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               clock::now().time_since_epoch())
+        .count();
+}
+
+void setDeadline(std::atomic<int64_t>& deadlineUs, int64_t timeoutUs)
+{
+    if (timeoutUs <= 0) {
+        deadlineUs.store(0);
+        return;
+    }
+    deadlineUs.store(steadyMicroseconds() + timeoutUs);
+}
+
+void setDictInt(AVDictionary** dict, const char* key, int64_t value)
+{
+    if (value <= 0) {
+        return;
+    }
+    const std::string text = std::to_string(value);
+    av_dict_set(dict, key, text.c_str(), 0);
+}
+
+void setDictString(AVDictionary** dict, const char* key, const QString& value)
+{
+    if (value.isEmpty()) {
+        return;
+    }
+    const QByteArray bytes = value.toUtf8();
+    av_dict_set(dict, key, bytes.constData(), 0);
+}
+
+AVDictionary* buildInputOptions(const QUrl& url, const NetworkOptions& options)
+{
+    if (!options.networkStream) {
+        return nullptr;
+    }
+
+    AVDictionary* dict = nullptr;
+    setDictInt(&dict, "rw_timeout", options.readTimeoutUs);
+    setDictInt(&dict, "buffer_size", options.recvBufferBytes);
+    setDictString(&dict, "user_agent", options.userAgent);
+    setDictString(&dict, "headers", options.extraHeaders);
+
+    if (isRtspScheme(url)) {
+        setDictString(&dict, "rtsp_transport", options.rtspTransport);
+        setDictInt(&dict, "stimeout", options.rtspStimeoutUs);
+        setDictInt(&dict, "timeout", options.rtspStimeoutUs);
+    }
+
+    if (url.scheme().toLower() == "rtmp") {
+        av_dict_set(&dict, "rtmp_live", options.rtmpLive ? "live" : "any", 0);
+    }
+
+    return dict;
+}
+
 } // namespace
 
 Demuxer::Demuxer() = default;
@@ -55,7 +123,7 @@ Demuxer::~Demuxer()
     close();
 }
 
-int Demuxer::open(const QUrl& url)
+int Demuxer::open(const QUrl& url, const NetworkOptions& options)
 {
     close();
     //将url初步检测是本地文件还是网络流
@@ -74,7 +142,13 @@ int Demuxer::open(const QUrl& url)
     ctx->interrupt_callback.callback = &Demuxer::interruptCb;
     ctx->interrupt_callback.opaque = this;
 
-    int ret = avformat_open_input(&ctx, input.c_str(), nullptr, nullptr);
+    readTimeoutUs_.store(options.networkStream ? options.readTimeoutUs : 0);
+
+    AVDictionary* inputOptions = buildInputOptions(url, options);
+    setDeadline(ioDeadlineUs_, options.networkStream ? options.openTimeoutUs : 0);
+    int ret = avformat_open_input(&ctx, input.c_str(), nullptr, &inputOptions);
+    ioDeadlineUs_.store(0);
+    av_dict_free(&inputOptions);
     if (ret < 0) {
         if (errorCb_) {
             errorCb_(ret, "avformat_open_input failed: " + avErrorString(ret));
@@ -83,7 +157,9 @@ int Demuxer::open(const QUrl& url)
         return ret;
     }
 
+    setDeadline(ioDeadlineUs_, options.networkStream ? options.openTimeoutUs : 0);
     ret = avformat_find_stream_info(ctx, nullptr);
+    ioDeadlineUs_.store(0);
     if (ret < 0) {
         if (errorCb_) {
             errorCb_(ret, "avformat_find_stream_info failed: " + avErrorString(ret));
@@ -121,6 +197,8 @@ void Demuxer::close()
         seekReqUs_ = 0;
     }
 
+    ioDeadlineUs_.store(0);
+    readTimeoutUs_.store(0);
     realtime_ = false;
 }
 
@@ -453,7 +531,9 @@ void Demuxer::readLoop()
             }
         }
 
+        setDeadline(ioDeadlineUs_, readTimeoutUs_.load());
         const int ret = av_read_frame(fmtCtx_, pkt);
+        ioDeadlineUs_.store(0);
         if (ret == 0) {
             if (seekPending_) {
                 av_packet_unref(pkt);
@@ -601,5 +681,12 @@ PacketQueue* Demuxer::findQueue(int streamIndex)
 int Demuxer::interruptCb(void* opaque)
 {
     Demuxer* demuxer = static_cast<Demuxer*>(opaque);
-    return demuxer && demuxer->abort_ ? 1 : 0;
+    if (!demuxer) {
+        return 0;
+    }
+    if (demuxer->abort_) {
+        return 1;
+    }
+    const int64_t deadlineUs = demuxer->ioDeadlineUs_.load();
+    return deadlineUs > 0 && steadyMicroseconds() >= deadlineUs ? 1 : 0;
 }
