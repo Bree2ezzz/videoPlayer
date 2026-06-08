@@ -95,10 +95,15 @@ void RenderScheduler::setRenderer(VideoRendererBase* renderer)
     renderer_ = renderer;
 }
 
-void RenderScheduler::setTimeBase(AVRational timeBase)
+void RenderScheduler::setTimeBase(AVRational timeBase,
+                                  int64_t sourceStartTime,
+                                  bool normalizeTimestamps)
 {
     timeBaseNum_.store(timeBase.num);
     timeBaseDen_.store(timeBase.den);
+    sourceStartTime_.store(sourceStartTime);
+    normalizeTimestamps_.store(normalizeTimestamps);
+    timestampOriginPts_ = normalizeTimestamps ? sourceStartTime : AV_NOPTS_VALUE;
 }
 
 void RenderScheduler::setSourceFrameRate(AVRational frameRate)
@@ -150,6 +155,9 @@ int RenderScheduler::start()
     lastPtsSec_ = quietNaN();
     frameTimer_ = steadySeconds();
     timingSerial_ = -1;
+    timestampOriginPts_ = normalizeTimestamps_.load()
+                              ? sourceStartTime_.load()
+                              : AV_NOPTS_VALUE;
     stepForwardRequested_.store(false);
     seekTargetPtsSec_.store(-1.0);
     seekSerial_.store(-1);
@@ -267,6 +275,9 @@ void RenderScheduler::scheduleLoop()
             frameTimer_ = steadySeconds();
             lastDisplayedPts_.store(0.0);
             timingSerial_ = -1;
+            timestampOriginPts_ = normalizeTimestamps_.load()
+                                      ? sourceStartTime_.load()
+                                      : AV_NOPTS_VALUE;
         }
 
         const bool stepping = paused_.load() && stepForwardRequested_.load();
@@ -458,7 +469,7 @@ double RenderScheduler::computeDelaySec(double framePtsSec, double lastFramePtsS
     return fallbackDelay;
 }
 
-double RenderScheduler::framePtsToSeconds(const AVFrame* frame) const
+double RenderScheduler::framePtsToSeconds(const AVFrame* frame)
 {
     if (!frame) {
         return quietNaN();
@@ -478,7 +489,15 @@ double RenderScheduler::framePtsToSeconds(const AVFrame* frame) const
         return quietNaN();
     }
 
-    return static_cast<double>(pts) * static_cast<double>(num) /
+    int64_t normalizedPts = pts;
+    if (normalizeTimestamps_.load()) {
+        if (timestampOriginPts_ == AV_NOPTS_VALUE) {
+            timestampOriginPts_ = pts;
+        }
+        normalizedPts = pts - timestampOriginPts_;
+    }
+
+    return static_cast<double>(normalizedPts) * static_cast<double>(num) /
            static_cast<double>(den);
 }
 

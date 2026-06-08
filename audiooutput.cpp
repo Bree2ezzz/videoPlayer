@@ -53,6 +53,8 @@ AudioOutput::~AudioOutput()
 
 int AudioOutput::open(const AVCodecParameters* sourceCodecpar,
                       AVRational sourceTimeBase,
+                      int64_t sourceStartTime,
+                      bool normalizeTimestamps,
                       const AudioOutputParams& targetParams)
 {
 
@@ -85,6 +87,9 @@ int AudioOutput::open(const AVCodecParameters* sourceCodecpar,
     srcSampleFormat_ = static_cast<AVSampleFormat>(sourceCodecpar->format);
     srcSampleRate_ = sourceCodecpar->sample_rate;
     srcTimeBase_ = sourceTimeBase;
+    sourceStartTime_ = sourceStartTime;
+    normalizeTimestamps_ = normalizeTimestamps;
+    timestampOriginPts_ = normalizeTimestamps_ ? sourceStartTime_ : AV_NOPTS_VALUE;
 
     int ret = av_channel_layout_copy(&srcChLayout_, &sourceCodecpar->ch_layout);
     if (ret < 0) {
@@ -173,6 +178,9 @@ void AudioOutput::close()
     srcSampleFormat_ = AV_SAMPLE_FMT_NONE;
     srcSampleRate_ = 0;
     srcTimeBase_ = {0, 1};
+    sourceStartTime_ = AV_NOPTS_VALUE;
+    timestampOriginPts_ = AV_NOPTS_VALUE;
+    normalizeTimestamps_ = false;
 
     requestedParams_ = AudioOutputParams{};
     actualParams_ = AudioOutputParams{};
@@ -492,10 +500,9 @@ int AudioOutput::refillResampleBuffer()
         if (framePts == AV_NOPTS_VALUE) {
             framePts = frame->best_effort_timestamp;
         }
-        framePtsSec =
-            framePts != AV_NOPTS_VALUE
-                ? static_cast<double>(framePts) * av_q2d(srcTimeBase_)
-                : audioClock_.load();
+        framePtsSec = framePts != AV_NOPTS_VALUE
+                          ? framePtsToSecondsLocked(framePts)
+                          : audioClock_.load();
         frameSampleRate = frame->sample_rate > 0 ? frame->sample_rate : srcSampleRate_;
         skipSamples = 0;
 
@@ -687,6 +694,23 @@ int AudioOutput::ensureSwrContextLocked(const AVFrame* frame)
     }
 
     return 0;
+}
+
+double AudioOutput::framePtsToSecondsLocked(int64_t framePts)
+{
+    if (framePts == AV_NOPTS_VALUE) {
+        return audioClock_.load();
+    }
+
+    int64_t normalizedPts = framePts;
+    if (normalizeTimestamps_) {
+        if (timestampOriginPts_ == AV_NOPTS_VALUE) {
+            timestampOriginPts_ = framePts;
+        }
+        normalizedPts = framePts - timestampOriginPts_;
+    }
+
+    return static_cast<double>(normalizedPts) * av_q2d(srcTimeBase_);
 }
 
 void AudioOutput::updateAudioClock(double pts)

@@ -26,7 +26,9 @@ public:
         EndOfStream = -2,
     };
 
-    explicit FrameQueue(size_t maxSize = 16) : maxSize_(maxSize) {}
+    explicit FrameQueue(size_t maxSize = 16, bool dropOldestOnFull = false)
+        : maxSize_(maxSize > 0 ? maxSize : 1),
+          dropOldestOnFull_(dropOldestOnFull) {}
     ~FrameQueue() { flush(); }
 
     FrameQueue(const FrameQueue&) = delete;
@@ -37,9 +39,17 @@ public:
         if (!frame) return Aborted;
 
         std::unique_lock<std::mutex> lock(mutex_);
-        notFull_.wait(lock, [this] {
-            return queue_.size() < maxSize_ || producerClosed_ || consumerClosed_;
-        });
+        if (dropOldestOnFull_) {
+            while (queue_.size() >= maxSize_ && !producerClosed_ && !consumerClosed_) {
+                Entry entry = queue_.front();
+                queue_.pop();
+                av_frame_free(&entry.frame);
+            }
+        } else {
+            notFull_.wait(lock, [this] {
+                return queue_.size() < maxSize_ || producerClosed_ || consumerClosed_;
+            });
+        }
 
         if (producerClosed_ || consumerClosed_) return Aborted;
 
@@ -143,6 +153,7 @@ private:
     std::condition_variable notEmpty_;
     std::condition_variable notFull_;
     size_t maxSize_;
+    bool dropOldestOnFull_;
     bool producerClosed_ = false;
     bool consumerClosed_ = false;
 };

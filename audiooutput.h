@@ -6,6 +6,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/rational.h>
 #include <libavutil/samplefmt.h>
@@ -75,6 +76,8 @@ public:
     // 设备默认处于暂停态；调用 start() 之后才会真正开始播放。
     int open(const AVCodecParameters* sourceCodecpar,
              AVRational sourceTimeBase,
+             int64_t sourceStartTime = AV_NOPTS_VALUE,
+             bool normalizeTimestamps = false,
              const AudioOutputParams& targetParams = AudioOutputParams());
 
     // 关闭 SDL 设备、释放 SwrContext。调用前建议已 stop()。
@@ -152,6 +155,8 @@ private:
     // 调用者需已持有 callbackMutex_。
     int ensureSwrContextLocked(const AVFrame* frame);
 
+    double framePtsToSecondsLocked(int64_t framePts);
+
     // 把 audioClock_ 和 audioClockUpdateTime_ 一起更新（供 AVSync 读取）。
     void updateAudioClock(double pts);
 
@@ -165,6 +170,9 @@ private:
     int srcSampleRate_ = 0;
     AVChannelLayout srcChLayout_{}; // 用 av_channel_layout_copy / uninit 管理
     AVRational srcTimeBase_ = {0, 1};
+    int64_t sourceStartTime_ = AV_NOPTS_VALUE;
+    int64_t timestampOriginPts_ = AV_NOPTS_VALUE;
+    bool normalizeTimestamps_ = false;
 
     // ---------- 目标格式 ----------
     AudioOutputParams requestedParams_{};     // 应用请求的
