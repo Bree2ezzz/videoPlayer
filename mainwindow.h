@@ -10,6 +10,7 @@
 class QVBoxLayout;
 class QWidget;
 class QCloseEvent;
+class QEvent;
 class QKeyEvent;
 class QLabel;
 class QMenu;
@@ -56,6 +57,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
 
 private slots:
@@ -85,6 +87,7 @@ private:
     void updatePositionControls(double positionSec, double durationSec);
     void updateVolumeControls(float volume, bool muted);
     void updatePlaybackRateControl(float rate);
+    void updateOpeningIndicator();
 
     // 把状态栏更新成与 controller_ 当前状态匹配
     void updateStatusBar();
@@ -104,6 +107,7 @@ private:
     // ---------- UI 节点 ----------
     QWidget* videoContainer_ = nullptr;     // 中央上半部分：只承载视频渲染器
     QVBoxLayout* videoLayout_ = nullptr;
+    QLabel* openingLabel_ = nullptr;
     QWidget* controlsWidget_ = nullptr;
     QSlider* progressSlider_ = nullptr;
     QSlider* volumeSlider_ = nullptr;

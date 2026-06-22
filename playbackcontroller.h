@@ -8,6 +8,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "videorendererbase.h"
 class Demuxer;
 class Decoder;
@@ -183,13 +184,23 @@ private slots:
     void handleErrorFromModule(int errCode, const QString& msg);
 
 private:
+    struct OpenJob;
+    struct OpenResult;
+
     // ---------- 状态机辅助 ----------
     void transitionTo(State newState);
     void enterError(int errCode, const QString& msg);
 
     // 装配 / 拆除子模块。失败回退到 Idle 并 emit error。
     bool buildPipeline(const QUrl& url);
+    bool finishPipelineAfterDemuxerOpen();
+    void readDemuxerInfo();
     void teardownPipeline();
+    void startOpenWorker(const QUrl& url, unsigned long long serial, bool autoPlay);
+    void handleOpenWorkerResult(unsigned long long serial,
+                                const std::shared_ptr<OpenResult>& result);
+    void cancelOpenWorker();
+    void joinOpenWorker();
 
     // 装配阶段细分，便于失败定位
     bool openDemuxer(const QUrl& url);
@@ -220,6 +231,10 @@ private:
     std::unique_ptr<AudioOutput> audioOutput_;
     std::unique_ptr<RenderScheduler> renderScheduler_;
     std::unique_ptr<AVSync> avSync_;
+
+    // ---------- 异步 open ----------
+    std::thread openThread_;
+    std::shared_ptr<OpenJob> openJob_;
 
     // 队列：解封装→解码、解码→输出
     std::unique_ptr<PacketQueue> videoPacketQueue_;

@@ -6,6 +6,7 @@
 
 #include <QAction>
 #include <QCloseEvent>
+#include <QEvent>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -89,6 +90,7 @@ MainWindow::MainWindow(QWidget* parent)
     videoContainer_->setMouseTracking(true);
     videoContainer_->setAutoFillBackground(false);
     videoContainer_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    videoContainer_->installEventFilter(this);
     mainLayout->addWidget(videoContainer_, 1);
 
     videoLayout_ = new QVBoxLayout(videoContainer_);
@@ -96,6 +98,17 @@ MainWindow::MainWindow(QWidget* parent)
     videoLayout_->setSpacing(0);
 
     installRenderer(RendererKind::Software);
+
+    openingLabel_ = new QLabel(QStringLiteral("Opening media..."), videoContainer_);
+    openingLabel_->setAlignment(Qt::AlignCenter);
+    openingLabel_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    openingLabel_->setStyleSheet(QStringLiteral(
+        "background-color: rgba(0, 0, 0, 150);"
+        "color: #f2f2f2;"
+        "font-size: 18px;"
+        "font-weight: 600;"));
+    openingLabel_->hide();
+
     setupControlsWidget();
 
     QMenu* fileMenu = menuBar()->addMenu(QStringLiteral("File"));
@@ -147,6 +160,7 @@ MainWindow::MainWindow(QWidget* parent)
     statusLabel_->setMinimumWidth(260);
     statusBar()->addPermanentWidget(statusLabel_, 1);
     updateStatusBar();
+    updateOpeningIndicator();
 }
 
 MainWindow::~MainWindow()
@@ -171,6 +185,16 @@ void MainWindow::closeEvent(QCloseEvent* event)
 {
     controller_->close();
     QMainWindow::closeEvent(event);
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == videoContainer_ &&
+        (event->type() == QEvent::Resize || event->type() == QEvent::Show)) {
+        updateOpeningIndicator();
+    }
+
+    return QMainWindow::eventFilter(watched, event);
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event)
@@ -296,6 +320,7 @@ void MainWindow::onStateChanged(PlaybackController::State)
 {
     updateStatusBar();
     updateControlsState();
+    updateOpeningIndicator();
 }
 
 void MainWindow::onMediaLoaded()
@@ -304,6 +329,7 @@ void MainWindow::onMediaLoaded()
     updatePositionControls(controller_->positionSec(), controller_->durationSec());
     updateVolumeControls(controller_->volume(), controller_->isMuted());
     updateControlsState();
+    updateOpeningIndicator();
     statusBar()->showMessage(QStringLiteral("Media loaded"), 2000);
 }
 
@@ -315,6 +341,7 @@ void MainWindow::onPositionChanged(double positionSec, double durationSec)
 
 void MainWindow::onErrorOccurred(int, const QString& msg)
 {
+    updateOpeningIndicator();
     statusBar()->showMessage(msg, 5000);
 }
 
@@ -323,6 +350,7 @@ void MainWindow::onEndOfStream()
     statusBar()->showMessage(QStringLiteral("End of stream"), 3000);
     updateStatusBar();
     updateControlsState();
+    updateOpeningIndicator();
 }
 
 void MainWindow::installRenderer(RendererKind kind)
@@ -588,6 +616,24 @@ void MainWindow::updatePlaybackRateControl(float rate)
 {
     if (speedButton_) {
         speedButton_->setText(playbackRateText(rate));
+    }
+}
+
+void MainWindow::updateOpeningIndicator()
+{
+    if (!openingLabel_ || !videoContainer_) {
+        return;
+    }
+
+    const bool opening = controller_ &&
+                         controller_->state() == PlaybackController::State::Opening;
+    openingLabel_->setGeometry(videoContainer_->rect());
+    openingLabel_->setVisible(opening);
+    if (opening) {
+        openingLabel_->raise();
+        statusBar()->showMessage(QStringLiteral("Opening media..."), 0);
+    } else if (statusBar()->currentMessage() == QStringLiteral("Opening media...")) {
+        statusBar()->clearMessage();
     }
 }
 

@@ -23,6 +23,7 @@ extern "C" {
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -111,6 +112,43 @@ int reconnectDelayMs(int attempt)
 
 } // namespace
 
+struct PlaybackController::OpenJob {
+    void setActiveDemuxer(Demuxer* demuxer)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        activeDemuxer = demuxer;
+        if (cancelled.load() && activeDemuxer) {
+            activeDemuxer->stop();
+        }
+    }
+
+    void cancel()
+    {
+        cancelled.store(true);
+        std::lock_guard<std::mutex> lock(mutex);
+        if (activeDemuxer) {
+            activeDemuxer->stop();
+        }
+    }
+
+    bool isCancelled() const
+    {
+        return cancelled.load();
+    }
+
+    std::atomic_bool cancelled{false};
+    std::mutex mutex;
+    Demuxer* activeDemuxer = nullptr;
+};
+
+struct PlaybackController::OpenResult {
+    QUrl url;
+    bool autoPlay = false;
+    int errCode = 0;
+    QString errorMessage;
+    std::unique_ptr<Demuxer> demuxer;
+};
+
 PlaybackController::PlaybackController(QObject* parent)
     : QObject(parent),
       positionTimer_(new QTimer(this)),
@@ -128,6 +166,7 @@ PlaybackController::PlaybackController(QObject* parent)
 PlaybackController::~PlaybackController()
 {
     close();
+    joinOpenWorker();
 }
 
 void PlaybackController::setRenderer(VideoRendererBase* renderer)
@@ -142,37 +181,17 @@ void PlaybackController::open(const QUrl& url)
 {
     close();
     transitionTo(State::Opening);
+    currentUrl_ = url;
 
     const unsigned long long serial = openSerial_.load();
-    QPointer<PlaybackController> guard(this);
-    QMetaObject::invokeMethod(
-        this,
-        [guard, url, serial] {
-            if (!guard) {
-                return;
-            }
-            if (guard->openSerial_.load() != serial ||
-                guard->state() != PlaybackController::State::Opening) {
-                return;
-            }
-
-            guard->currentUrl_ = url;
-            if (!guard->buildPipeline(url)) {
-                return;
-            }
-
-            guard->reconnectAttempts_ = 0;
-            guard->livePausedByStop_ = false;
-            guard->transitionTo(State::Ready);
-            emit guard->mediaLoaded();
-            guard->onPositionTick();
-        },
-        Qt::QueuedConnection);
+    startOpenWorker(url, serial, false);
 }
 
 void PlaybackController::close()
 {
     ++openSerial_;
+    cancelOpenWorker();
+    joinOpenWorker();
     if (reconnectTimer_) {
         reconnectTimer_->stop();
     }
@@ -569,15 +588,34 @@ bool PlaybackController::buildPipeline(const QUrl& url)
     demuxer_ = std::make_unique<Demuxer>();
     avSync_ = std::make_unique<AVSync>();
 
-    if (!openDemuxer(url) ||
-        !openDecoders() ||
-        !openAudioOutput() ||
-        !wireScheduler()) {
+    if (!openDemuxer(url) || !finishPipelineAfterDemuxerOpen()) {
         teardownPipeline();
         const bool reconnectPending = reconnectTimer_ && reconnectTimer_->isActive();
         if (!reconnectPending && state() != State::Error) {
             transitionTo(State::Idle);
         }
+        return false;
+    }
+
+    return true;
+}
+
+bool PlaybackController::finishPipelineAfterDemuxerOpen()
+{
+    if (!demuxer_) {
+        enterError(AVERROR(EINVAL), QStringLiteral("Demuxer is not open"));
+        return false;
+    }
+
+    if (!avSync_) {
+        avSync_ = std::make_unique<AVSync>();
+    }
+
+    readDemuxerInfo();
+
+    if (!openDecoders() ||
+        !openAudioOutput() ||
+        !wireScheduler()) {
         return false;
     }
 
@@ -587,6 +625,19 @@ bool PlaybackController::buildPipeline(const QUrl& url)
     applyVolumeToOutput();
     applyPlaybackRateToOutputs();
     return true;
+}
+
+void PlaybackController::readDemuxerInfo()
+{
+    videoStreamIndex_ = demuxer_ ? demuxer_->bestVideoStreamIndex() : -1;
+    audioStreamIndex_ = demuxer_ ? demuxer_->bestAudioStreamIndex() : -1;
+    realtime_ = demuxer_ ? demuxer_->isRealtime() : false;
+    videoFrameIntervalSec_ = 1.0 / 25.0;
+
+    const int64_t durationUs = demuxer_ ? demuxer_->durationUs() : -1;
+    durationSec_ = durationUs >= 0
+                       ? static_cast<double>(durationUs) / static_cast<double>(AV_TIME_BASE)
+                       : -1.0;
 }
 
 void PlaybackController::teardownPipeline()
@@ -624,6 +675,121 @@ void PlaybackController::teardownPipeline()
     audioPacketQueue_.reset();
 }
 
+void PlaybackController::startOpenWorker(const QUrl& url,
+                                         unsigned long long serial,
+                                         bool autoPlay)
+{
+    joinOpenWorker();
+
+    auto job = std::make_shared<OpenJob>();
+    openJob_ = job;
+
+    PlaybackController* controller = this;
+    openThread_ = std::thread(
+        [controller, url, serial, autoPlay, job] {
+            auto result = std::make_shared<OpenResult>();
+            result->url = url;
+            result->autoPlay = autoPlay;
+            result->demuxer = std::make_unique<Demuxer>();
+
+            if (job->isCancelled()) {
+                return;
+            }
+
+            job->setActiveDemuxer(result->demuxer.get());
+            if (job->isCancelled()) {
+                job->setActiveDemuxer(nullptr);
+                return;
+            }
+
+            const int ret = result->demuxer->open(url, networkOptionsForUrl(url));
+            job->setActiveDemuxer(nullptr);
+
+            if (job->isCancelled()) {
+                return;
+            }
+
+            if (ret < 0) {
+                result->errCode = ret;
+                result->errorMessage =
+                    QStringLiteral("Demuxer open failed: ") + avErrorString(ret);
+                result->demuxer.reset();
+            }
+
+            QMetaObject::invokeMethod(
+                controller,
+                [controller, serial, result] {
+                    controller->handleOpenWorkerResult(serial, result);
+                },
+                Qt::QueuedConnection);
+        });
+}
+
+void PlaybackController::handleOpenWorkerResult(
+    unsigned long long serial,
+    const std::shared_ptr<OpenResult>& result)
+{
+    if (!result ||
+        openSerial_.load() != serial ||
+        state() != State::Opening) {
+        return;
+    }
+
+    joinOpenWorker();
+    openJob_.reset();
+
+    currentUrl_ = result->url;
+
+    if (result->errCode < 0) {
+        enterError(result->errCode, result->errorMessage);
+        return;
+    }
+
+    teardownPipeline();
+    demuxer_ = std::move(result->demuxer);
+    avSync_ = std::make_unique<AVSync>();
+
+    if (!finishPipelineAfterDemuxerOpen()) {
+        teardownPipeline();
+        const bool reconnectPending = reconnectTimer_ && reconnectTimer_->isActive();
+        if (!reconnectPending && state() != State::Error) {
+            transitionTo(State::Idle);
+        }
+        return;
+    }
+
+    reconnectAttempts_ = 0;
+    livePausedByStop_ = false;
+    transitionTo(State::Ready);
+    emit mediaLoaded();
+    onPositionTick();
+
+    if (result->autoPlay) {
+        play();
+    }
+}
+
+void PlaybackController::cancelOpenWorker()
+{
+    if (openJob_) {
+        openJob_->cancel();
+        openJob_.reset();
+    }
+}
+
+void PlaybackController::joinOpenWorker()
+{
+    if (!openThread_.joinable()) {
+        return;
+    }
+
+    if (openThread_.get_id() == std::this_thread::get_id()) {
+        return;
+    }
+
+    openThread_.join();
+}
+
 bool PlaybackController::openDemuxer(const QUrl& url)
 {
     const int ret = demuxer_->open(url, networkOptionsForUrl(url));
@@ -632,16 +798,7 @@ bool PlaybackController::openDemuxer(const QUrl& url)
         return false;
     }
 
-    videoStreamIndex_ = demuxer_->bestVideoStreamIndex();
-    audioStreamIndex_ = demuxer_->bestAudioStreamIndex();
-    realtime_ = demuxer_->isRealtime();
-    videoFrameIntervalSec_ = 1.0 / 25.0;
-
-    const int64_t durationUs = demuxer_->durationUs();
-    durationSec_ = durationUs >= 0
-                       ? static_cast<double>(durationUs) / static_cast<double>(AV_TIME_BASE)
-                       : -1.0;
-
+    readDemuxerInfo();
     return true;
 }
 
@@ -866,16 +1023,8 @@ void PlaybackController::performReconnect()
         return;
     }
 
-    if (!buildPipeline(currentUrl_)) {
-        return;
-    }
-
-    reconnectAttempts_ = 0;
-    livePausedByStop_ = false;
-    transitionTo(State::Ready);
-    emit mediaLoaded();
-    onPositionTick();
-    play();
+    const unsigned long long serial = openSerial_.load();
+    startOpenWorker(currentUrl_, serial, true);
 }
 
 void PlaybackController::applyVolumeToOutput()
