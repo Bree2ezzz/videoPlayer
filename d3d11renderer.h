@@ -3,12 +3,17 @@
 
 #include "videorendererbase.h"
 
+#include <dxgiformat.h>
+#include <QUrl>
+
 #include <atomic>
+#include <functional>
 #include <mutex>
 
 class D3D11Context;
 class D3D11RenderSurface;
 class QWidget;
+class QString;
 
 struct ID3D11Texture2D;
 struct ID3D11RenderTargetView;
@@ -31,6 +36,12 @@ public:
     int preferredPixelFormat() const override;
     bool isReady() const { return initialized_.load(); }
 
+    using UnsupportedFormatCallback = std::function<void(unsigned long long sessionId,
+                                                          const QUrl& url,
+                                                          const QString& reason)>;
+    void setUnsupportedFormatCallback(UnsupportedFormatCallback callback);
+    void setPlaybackSession(unsigned long long sessionId, const QUrl& url);
+
     void resizeSwapChain(int width, int height);
     void present();
 
@@ -38,7 +49,13 @@ private:
     bool initializeSwapChain();
     bool initializePipeline();
     bool createRenderTarget();
-    bool ensureVideoTexture(int width, int height);
+    bool ensureVideoTexture(int width, int height, DXGI_FORMAT sourceFormat);
+    void reportUnsupportedFormat(unsigned long long sessionId,
+                                 const QUrl& url,
+                                 DXGI_FORMAT sourceFormat);
+    void reportFallback(unsigned long long sessionId,
+                        const QUrl& url,
+                        const QString& reason);
     void releaseSizeDependentResources();
     void releasePipelineResources();
     void clearBackBuffer();
@@ -50,12 +67,16 @@ private:
 
     std::mutex pendingMutex_;
     AVFrame* pendingFrame_ = nullptr;
+    unsigned long long activeSessionId_ = 0;
+    QUrl activeSessionUrl_;
+    unsigned long long pendingSessionId_ = 0;
+    QUrl pendingSessionUrl_;
     bool clearRequested_ = false;
     bool presentQueued_ = false;
 
     IDXGISwapChain1* swapChain_ = nullptr;
     ID3D11RenderTargetView* renderTargetView_ = nullptr;
-    ID3D11Texture2D* sampledNv12Texture_ = nullptr;
+    ID3D11Texture2D* sampledYuvTexture_ = nullptr;
     ID3D11ShaderResourceView* lumaSrv_ = nullptr;
     ID3D11ShaderResourceView* chromaSrv_ = nullptr;
     ID3D11VertexShader* vertexShader_ = nullptr;
@@ -64,6 +85,9 @@ private:
     ID3D11Buffer* colorConstants_ = nullptr;
     int textureWidth_ = 0;
     int textureHeight_ = 0;
+    DXGI_FORMAT textureFormat_ = DXGI_FORMAT_UNKNOWN;
+    UnsupportedFormatCallback unsupportedFormatCallback_;
+    std::atomic<unsigned long long> fallbackReportedSessionId_{0};
     std::atomic_bool initialized_{false};
 };
 

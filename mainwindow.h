@@ -55,7 +55,10 @@ private slots:
     void onSwitchRenderer();
     void onToggleFullscreen();
     void onAbout();
-    void onD3D11FallbackRequested(const QString& reason);
+    void onPlaybackSessionChanged(unsigned long long sessionId, const QUrl& url);
+    void onD3D11FallbackRequested(unsigned long long sessionId,
+                                   const QUrl& url,
+                                   const QString& reason);
 
     void onStateChanged(PlaybackController::State newState);
     void onMediaLoaded();
@@ -67,6 +70,7 @@ private:
     bool installRenderer(PlaybackProfile profile);
     void removeCurrentRenderer();
     void activateProfile(PlaybackProfile profile, bool reopenMedia);
+    void updateD3D11RendererSession();
     void updateProfileActions();
 
     void setupControlsWidget();
@@ -88,6 +92,7 @@ private:
     PlaybackProfile playbackProfile_ = PlaybackProfile::Software;
     std::unique_ptr<D3D11Context> d3d11Context_;
     QUrl requestedMediaUrl_;
+    unsigned long long requestedSessionId_ = 0;
 
     QWidget* videoContainer_ = nullptr;
     QVBoxLayout* videoLayout_ = nullptr;

@@ -101,6 +101,7 @@ public:
     // Profile is fixed for one open cycle. MainWindow must close before changing it.
     void setPlaybackProfile(PlaybackProfile profile, D3D11Context* sharedD3D11 = nullptr);
     PlaybackProfile playbackProfile() const;
+    unsigned long long openSessionId() const;
 
     // ---------- 生命周期 ----------
     // 异步打开。UI 立即返回，最终结果通过 stateChanged() / errorOccurred() 通知。
@@ -178,8 +179,14 @@ signals:
     // seek 完成（state 已经回到 seek 前的 Playing/Paused）
     void seekFinished();
 
+    // Emitted for every new open session, including automatic network reconnects.
+    void playbackSessionChanged(unsigned long long sessionId, const QUrl& url);
+
     // D3D11 device setup or codec format negotiation failed; UI rebuilds the Software profile.
-    void d3d11FallbackRequested(const QString& reason);
+    // Session and URL make queued fallback notifications harmless after close/reopen/profile changes.
+    void d3d11FallbackRequested(unsigned long long sessionId,
+                                const QUrl& url,
+                                const QString& reason);
 
 public slots:
     // UI 拖动进度条结束时调用：等价于 seek(positionSec)

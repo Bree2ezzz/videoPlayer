@@ -7,6 +7,7 @@
 #include <QPaintEngine>
 #include <QPaintEvent>
 #include <QResizeEvent>
+#include <QString>
 #include <QWidget>
 
 #include <d3dcompiler.h>
@@ -19,6 +20,7 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <utility>
 
 namespace {
 
@@ -124,23 +126,70 @@ bool compileShader(const char* entryPoint, const char* target, ID3DBlob** blob)
     releaseCom(errors);
     return true;
 }
-ColorConstants colorConstantsForFrame(const AVFrame* frame)
+bool isSupportedVideoTextureFormat(DXGI_FORMAT format)
 {
-    ColorConstants constants = {
-        {-16.0f / 255.0f, -0.5f, -0.5f, 0.0f},
-        {1.164383f, 0.0f, 1.596027f, 0.0f},
-        {1.164383f, -0.391762f, -0.812968f, 0.0f},
-        {1.164383f, 2.017232f, 0.0f, 0.0f},
-    };
-    if (frame && frame->colorspace == AVCOL_SPC_BT709) {
-        constants.row0[2] = 1.792741f;
-        constants.row1[1] = -0.213249f;
-        constants.row1[2] = -0.532909f;
-        constants.row2[1] = 2.112402f;
-    }
-    return constants;
+    return format == DXGI_FORMAT_NV12 || format == DXGI_FORMAT_P010;
 }
 
+ColorConstants colorConstantsForFrame(const AVFrame* frame, DXGI_FORMAT textureFormat)
+{
+    const bool tenBit = textureFormat == DXGI_FORMAT_P010;
+    const float containerMax = tenBit ? 65535.0f : 255.0f;
+    const float storageScale = tenBit ? 64.0f : 1.0f;
+    const float signalMax = tenBit ? 1023.0f : 255.0f;
+    const float lumaBlack = tenBit ? 64.0f : 16.0f;
+    const float lumaSpan = tenBit ? 876.0f : 219.0f;
+    const float chromaCenter = tenBit ? 512.0f : 128.0f;
+    const float chromaSpan = tenBit ? 896.0f : 224.0f;
+    const bool fullRange = frame && frame->color_range == AVCOL_RANGE_JPEG;
+
+    // P010 stores the ten meaningful bits in the upper bits of a 16-bit UNORM sample.
+    const float lumaScale = fullRange
+                                ? containerMax / (signalMax * storageScale)
+                                : containerMax / (lumaSpan * storageScale);
+    const float chromaScale = fullRange
+                                  ? containerMax / (signalMax * storageScale)
+                                  : containerMax / (chromaSpan * storageScale);
+    const float lumaOffset = fullRange ? 0.0f : -(lumaBlack * storageScale) / containerMax;
+    const float chromaOffset = -(chromaCenter * storageScale) / containerMax;
+
+    float redU = 0.0f;
+    float redV = 1.402f;
+    float greenU = -0.344136f;
+    float greenV = -0.714136f;
+    float blueU = 1.772f;
+    float blueV = 0.0f;
+
+    const AVColorSpace colorspace = frame ? frame->colorspace : AVCOL_SPC_UNSPECIFIED;
+    const bool unspecifiedHd = colorspace == AVCOL_SPC_UNSPECIFIED && frame &&
+                               (frame->width >= 1280 || frame->height > 576);
+    if (colorspace == AVCOL_SPC_BT2020_NCL) {
+        redV = 1.474600f;
+        greenU = -0.164553f;
+        greenV = -0.571353f;
+        blueU = 1.881400f;
+    } else if (colorspace == AVCOL_SPC_BT709 || unspecifiedHd) {
+        redV = 1.574800f;
+        greenU = -0.187324f;
+        greenV = -0.468124f;
+        blueU = 1.855600f;
+    }
+
+    ColorConstants constants = {};
+    constants.offset[0] = lumaOffset;
+    constants.offset[1] = chromaOffset;
+    constants.offset[2] = chromaOffset;
+    constants.row0[0] = lumaScale;
+    constants.row0[1] = redU * chromaScale;
+    constants.row0[2] = redV * chromaScale;
+    constants.row1[0] = lumaScale;
+    constants.row1[1] = greenU * chromaScale;
+    constants.row1[2] = greenV * chromaScale;
+    constants.row2[0] = lumaScale;
+    constants.row2[1] = blueU * chromaScale;
+    constants.row2[2] = blueV * chromaScale;
+    return constants;
+}
 } // namespace
 
 class D3D11RenderSurface final : public QWidget
@@ -245,6 +294,8 @@ void D3D11Renderer::renderFrame(AVFrame* frame)
             VP_ERROR("D3D11Renderer av_frame_ref failed");
             return;
         }
+        pendingSessionId_ = activeSessionId_;
+        pendingSessionUrl_ = activeSessionUrl_;
         clearRequested_ = false;
         queuePresentLocked(&shouldQueue);
     }
@@ -275,6 +326,18 @@ QWidget* D3D11Renderer::asWidget()
 int D3D11Renderer::preferredPixelFormat() const
 {
     return AV_PIX_FMT_D3D11;
+}
+
+void D3D11Renderer::setUnsupportedFormatCallback(UnsupportedFormatCallback callback)
+{
+    unsupportedFormatCallback_ = std::move(callback);
+}
+
+void D3D11Renderer::setPlaybackSession(unsigned long long sessionId, const QUrl& url)
+{
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    activeSessionId_ = sessionId;
+    activeSessionUrl_ = url;
 }
 
 void D3D11Renderer::resizeSwapChain(int width, int height)
@@ -308,6 +371,8 @@ void D3D11Renderer::resizeSwapChain(int width, int height)
 void D3D11Renderer::present()
 {
     AVFrame* frame = av_frame_alloc();
+    unsigned long long frameSessionId = 0;
+    QUrl frameSessionUrl;
     bool clearOnly = false;
     bool shouldQueueAgain = false;
     if (!frame) {
@@ -320,6 +385,8 @@ void D3D11Renderer::present()
         clearOnly = clearRequested_;
         clearRequested_ = false;
         av_frame_move_ref(frame, pendingFrame_);
+        frameSessionId = pendingSessionId_;
+        frameSessionUrl = pendingSessionUrl_;
         presentQueued_ = false;
     }
 
@@ -333,19 +400,42 @@ void D3D11Renderer::present()
         } else {
             ID3D11Texture2D* sourceTexture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
             const UINT sourceSubresource = static_cast<UINT>(reinterpret_cast<uintptr_t>(frame->data[1]));
-            if (!sourceTexture || !ensureVideoTexture(frame->width, frame->height)) {
-                VP_ERROR("D3D11Renderer cannot prepare NV12 texture source={} size={}x{}",
-                         static_cast<const void*>(sourceTexture), frame->width, frame->height);
+            D3D11_TEXTURE2D_DESC sourceDesc = {};
+            if (sourceTexture) {
+                sourceTexture->GetDesc(&sourceDesc);
+            }
+            if (frame->colorspace == AVCOL_SPC_BT2020_CL) {
+                reportFallback(frameSessionId,
+                               frameSessionUrl,
+                               QStringLiteral("BT.2020 constant-luminance video requires Software rendering"));
+            } else if (!sourceTexture || !isSupportedVideoTextureFormat(sourceDesc.Format)) {
+                reportUnsupportedFormat(frameSessionId, frameSessionUrl, sourceDesc.Format);
+            } else if (frame->width <= 0 || frame->height <= 0 ||
+                       static_cast<UINT>(frame->width) > sourceDesc.Width ||
+                       static_cast<UINT>(frame->height) > sourceDesc.Height ||
+                       !ensureVideoTexture(frame->width, frame->height, sourceDesc.Format)) {
+                VP_ERROR("D3D11Renderer cannot prepare texture format={} source={} size={}x{} source_size={}x{}",
+                         static_cast<unsigned int>(sourceDesc.Format),
+                         static_cast<const void*>(sourceTexture),
+                         frame->width,
+                         frame->height,
+                         sourceDesc.Width,
+                         sourceDesc.Height);
+                reportUnsupportedFormat(frameSessionId, frameSessionUrl, sourceDesc.Format);
             } else {
                 ID3D11DeviceContext* immediate = context_->immediateContext();
-                immediate->CopySubresourceRegion(sampledNv12Texture_,
+                D3D11_BOX sourceBox = {};
+                sourceBox.right = static_cast<UINT>(frame->width);
+                sourceBox.bottom = static_cast<UINT>(frame->height);
+                sourceBox.back = 1;
+                immediate->CopySubresourceRegion(sampledYuvTexture_,
                                                  0,
                                                  0,
                                                  0,
                                                  0,
                                                  sourceTexture,
                                                  sourceSubresource,
-                                                 nullptr);
+                                                 &sourceBox);
 
                 D3D11_VIEWPORT viewport = {};
                 const float outputWidth = static_cast<float>(std::max(surface_->width(), 1));
@@ -365,7 +455,7 @@ void D3D11Renderer::present()
                 viewport.MaxDepth = 1.0f;
 
                 clearBackBuffer();
-                const ColorConstants constants = colorConstantsForFrame(frame);
+                const ColorConstants constants = colorConstantsForFrame(frame, sourceDesc.Format);
                 immediate->UpdateSubresource(colorConstants_, 0, nullptr, &constants, 0, 0);
                 ID3D11ShaderResourceView* shaderResources[] = {lumaSrv_, chromaSrv_};
                 ID3D11Buffer* constantBuffers[] = {colorConstants_};
@@ -507,68 +597,104 @@ bool D3D11Renderer::createRenderTarget()
     }
     return true;
 }
-bool D3D11Renderer::ensureVideoTexture(int width, int height)
+bool D3D11Renderer::ensureVideoTexture(int width, int height, DXGI_FORMAT sourceFormat)
 {
-    if (width <= 0 || height <= 0 || (width & 1) || (height & 1)) {
+    if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
+        !isSupportedVideoTextureFormat(sourceFormat)) {
         return false;
     }
-    if (sampledNv12Texture_ && textureWidth_ == width && textureHeight_ == height) {
+    if (sampledYuvTexture_ && textureWidth_ == width && textureHeight_ == height &&
+        textureFormat_ == sourceFormat) {
         return true;
     }
 
     releaseCom(chromaSrv_);
     releaseCom(lumaSrv_);
-    releaseCom(sampledNv12Texture_);
+    releaseCom(sampledYuvTexture_);
     textureWidth_ = 0;
     textureHeight_ = 0;
+    textureFormat_ = DXGI_FORMAT_UNKNOWN;
 
     D3D11_TEXTURE2D_DESC textureDesc = {};
     textureDesc.Width = static_cast<UINT>(width);
     textureDesc.Height = static_cast<UINT>(height);
     textureDesc.MipLevels = 1;
     textureDesc.ArraySize = 1;
-    textureDesc.Format = DXGI_FORMAT_NV12;
+    textureDesc.Format = sourceFormat;
     textureDesc.SampleDesc.Count = 1;
     textureDesc.Usage = D3D11_USAGE_DEFAULT;
     textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-    HRESULT hr = context_->device()->CreateTexture2D(&textureDesc, nullptr, &sampledNv12Texture_);
+    HRESULT hr = context_->device()->CreateTexture2D(&textureDesc, nullptr, &sampledYuvTexture_);
     if (FAILED(hr)) {
-        VP_ERROR("CreateTexture2D NV12 failed {}x{} hr=0x{:08x}",
-                 width, height, static_cast<unsigned long>(hr));
+        VP_ERROR("CreateTexture2D format={} failed {}x{} hr=0x{:08x}",
+                 static_cast<unsigned int>(sourceFormat), width, height, static_cast<unsigned long>(hr));
         return false;
     }
 
+    const DXGI_FORMAT lumaFormat = sourceFormat == DXGI_FORMAT_P010
+                                       ? DXGI_FORMAT_R16_UNORM
+                                       : DXGI_FORMAT_R8_UNORM;
+    const DXGI_FORMAT chromaFormat = sourceFormat == DXGI_FORMAT_P010
+                                         ? DXGI_FORMAT_R16G16_UNORM
+                                         : DXGI_FORMAT_R8G8_UNORM;
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MostDetailedMip = 0;
     srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Format = DXGI_FORMAT_R8_UNORM;
-    hr = context_->device()->CreateShaderResourceView(sampledNv12Texture_, &srvDesc, &lumaSrv_);
+    srvDesc.Format = lumaFormat;
+    hr = context_->device()->CreateShaderResourceView(sampledYuvTexture_, &srvDesc, &lumaSrv_);
     if (SUCCEEDED(hr)) {
-        srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-        hr = context_->device()->CreateShaderResourceView(sampledNv12Texture_, &srvDesc, &chromaSrv_);
+        srvDesc.Format = chromaFormat;
+        hr = context_->device()->CreateShaderResourceView(sampledYuvTexture_, &srvDesc, &chromaSrv_);
     }
     if (FAILED(hr)) {
-        VP_ERROR("CreateShaderResourceView NV12 failed hr=0x{:08x}", static_cast<unsigned long>(hr));
+        VP_ERROR("CreateShaderResourceView format={} failed hr=0x{:08x}",
+                 static_cast<unsigned int>(sourceFormat), static_cast<unsigned long>(hr));
         releaseCom(chromaSrv_);
         releaseCom(lumaSrv_);
-        releaseCom(sampledNv12Texture_);
+        releaseCom(sampledYuvTexture_);
         return false;
     }
 
     textureWidth_ = width;
     textureHeight_ = height;
+    textureFormat_ = sourceFormat;
     return true;
+}
+
+void D3D11Renderer::reportUnsupportedFormat(unsigned long long sessionId,
+                                            const QUrl& url,
+                                            DXGI_FORMAT sourceFormat)
+{
+    reportFallback(sessionId,
+                   url,
+                   QStringLiteral("Unsupported D3D11 decoder texture format: %1")
+                       .arg(static_cast<unsigned int>(sourceFormat)));
+}
+
+void D3D11Renderer::reportFallback(unsigned long long sessionId,
+                                   const QUrl& url,
+                                   const QString& reason)
+{
+    if (fallbackReportedSessionId_.exchange(sessionId) == sessionId) {
+        return;
+    }
+
+    VP_ERROR("{}", reason.toStdString());
+    if (unsupportedFormatCallback_) {
+        unsupportedFormatCallback_(sessionId, url, reason);
+    }
 }
 void D3D11Renderer::releaseSizeDependentResources()
 {
     releaseCom(chromaSrv_);
     releaseCom(lumaSrv_);
-    releaseCom(sampledNv12Texture_);
+    releaseCom(sampledYuvTexture_);
     releaseCom(renderTargetView_);
     textureWidth_ = 0;
     textureHeight_ = 0;
+    textureFormat_ = DXGI_FORMAT_UNKNOWN;
 }
 
 void D3D11Renderer::releasePipelineResources()

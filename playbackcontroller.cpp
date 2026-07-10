@@ -264,6 +264,11 @@ PlaybackProfile PlaybackController::playbackProfile() const
     return playbackProfile_;
 }
 
+unsigned long long PlaybackController::openSessionId() const
+{
+    return openSerial_.load();
+}
+
 void PlaybackController::open(const QUrl& url)
 {
     close();
@@ -272,6 +277,7 @@ void PlaybackController::open(const QUrl& url)
 
     const unsigned long long serial = openSerial_.load();
     VP_INFO("open requested serial={} url={}", serial, urlForLog(url));
+    emit playbackSessionChanged(serial, currentUrl_);
     startOpenWorker(url, serial, false);
 }
 
@@ -575,10 +581,6 @@ double PlaybackController::positionSec() const
 
     if (hasAudio_ && audioOutput_) {
         const double clock = audioOutput_->audioClock();
-        // demuxer seekCompleted 回调内会把 audioClock seekTo 到 target，
-        // 但 controller 触发 seek 到 demuxer 真正执行之间存在短暂窗口
-        // （demuxer 线程要先看到 seekPending_）。窗口期 audioClock 还是
-        // 旧值，明显小于 target 时用 target 兜底。
         if (seekTarget >= 0.0 && clock < seekTarget - 0.1) {
             return seekTarget;
         }
@@ -940,10 +942,22 @@ void PlaybackController::requestD3D11Fallback(const QString& reason)
         return;
     }
 
-    VP_WARN("D3D11 profile fallback requested: {}", qStringForLog(reason));
+    const unsigned long long sessionId = openSerial_.load();
+    const QUrl url = currentUrl_;
+    VP_WARN("D3D11 profile fallback requested session={} url={} reason={}",
+            sessionId, urlForLog(url), qStringForLog(reason));
     QMetaObject::invokeMethod(
         this,
-        [this, reason] { emit d3d11FallbackRequested(reason); },
+        [this, sessionId, url, reason] {
+            if (openSerial_.load() != sessionId ||
+                playbackProfile_ != PlaybackProfile::D3D11 ||
+                currentUrl_ != url) {
+                VP_DEBUG("stale D3D11 fallback ignored session={} current_session={} url={}",
+                         sessionId, openSerial_.load(), urlForLog(url));
+                return;
+            }
+            emit d3d11FallbackRequested(sessionId, url, reason);
+        },
         Qt::QueuedConnection);
 }
 
@@ -1073,8 +1087,6 @@ bool PlaybackController::openAudioOutput()
 
     audioOutput_ = std::make_unique<AudioOutput>();
     audioOutput_->setFrameQueue(audioFrameQueue_.get());
-    // 把 packet queue 同时传给 audio output，供其在 pop frame 时通过
-    // currentSerial 判断"这个 frame 是否还属于当前 serial"。
     audioOutput_->setPacketQueue(audioPacketQueue_.get());
 
     const int ret = audioOutput_->open(stream->codecpar, stream->time_base);
@@ -1148,8 +1160,6 @@ void PlaybackController::doSeek(double positionSec)
     videoEofReceived_ = !hasVideo_;
     audioEofReceived_ = !hasAudio_;
 
-    // 实际清缓存、重置 clock 和 scheduler epoch 必须等 demuxer 成功 seek
-    // 且 packet serial 已推进后执行，否则旧帧可能重新污染视频定时状态。
     if (demuxer_) {
         demuxer_->seek(targetUs);
     }
@@ -1204,6 +1214,7 @@ bool PlaybackController::scheduleReconnect(int errCode, const QString& msg)
     positionTimer_->stop();
     teardownPipeline();
     transitionTo(State::Opening);
+    emit playbackSessionChanged(openSerial_.load(), currentUrl_);
 
     const int delayMs = reconnectDelayMs(reconnectAttempts_);
     emit errorOccurred(
@@ -1302,9 +1313,6 @@ void PlaybackController::installModuleCallbacks()
                 postError(QStringLiteral("Demuxer"), errCode, msg);
             });
 
-        // 此回调仍在 demuxer 线程：它发生在 av_seek_frame 成功且 packet
-        // serial 已推进之后，并且在任何新 packet 被读取之前。先同步配置
-        // 消费端的精确 seek 边界，再把状态变更投递回 GUI 线程。
         demuxer_->setSeekCompletedCallback(
             [guard, serial](int64_t timestampUs) {
                 if (!guard) return;

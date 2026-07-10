@@ -21,6 +21,7 @@
 #include <QLayout>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMetaObject>
 #include <QMessageBox>
 #include <QObject>
 #include <QPushButton>
@@ -192,6 +193,8 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onErrorOccurred);
     connect(controller_, &PlaybackController::endOfStream,
             this, &MainWindow::onEndOfStream);
+    connect(controller_, &PlaybackController::playbackSessionChanged,
+            this, &MainWindow::onPlaybackSessionChanged);
     connect(controller_, &PlaybackController::d3d11FallbackRequested,
             this, &MainWindow::onD3D11FallbackRequested);
     connect(controller_, &PlaybackController::volumeChanged,
@@ -235,6 +238,8 @@ void MainWindow::openMedia(const QUrl& url)
 
     requestedMediaUrl_ = url;
     controller_->open(url);
+    requestedSessionId_ = controller_->openSessionId();
+    updateD3D11RendererSession();
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)
@@ -371,21 +376,41 @@ void MainWindow::onAbout()
                        "HTTP-FLV, and HTTP/HTTPS media files."));
 }
 
-void MainWindow::onD3D11FallbackRequested(const QString& reason)
+void MainWindow::onPlaybackSessionChanged(unsigned long long sessionId, const QUrl& url)
 {
-    if (playbackProfile_ != PlaybackProfile::D3D11) {
+    if (!url.isValid() || url.isEmpty()) {
         return;
     }
 
-    VP_WARN("D3D11 profile fallback requested reason={}", reason.toStdString());
-    const QUrl url = requestedMediaUrl_;
+    requestedSessionId_ = sessionId;
+    requestedMediaUrl_ = url;
+    updateD3D11RendererSession();
+}
+
+void MainWindow::onD3D11FallbackRequested(unsigned long long sessionId,
+                                           const QUrl& url,
+                                           const QString& reason)
+{
+    if (playbackProfile_ != PlaybackProfile::D3D11 ||
+        sessionId != requestedSessionId_ ||
+        url != requestedMediaUrl_ ||
+        controller_->openSessionId() != sessionId) {
+        VP_DEBUG("stale D3D11 fallback ignored session={} current_session={} url={}",
+                 sessionId, requestedSessionId_, urlForLog(url));
+        return;
+    }
+
+    VP_WARN("D3D11 profile fallback requested session={} reason={}",
+            sessionId, reason.toStdString());
     controller_->close();
+    requestedSessionId_ = controller_->openSessionId();
     installRenderer(PlaybackProfile::Software);
     updateProfileActions();
     updateStatusBar();
     statusBar()->showMessage(QStringLiteral("D3D11 unavailable; switched to Software: %1").arg(reason), 5000);
     if (url.isValid() && !url.isEmpty()) {
         controller_->open(url);
+        requestedSessionId_ = controller_->openSessionId();
     }
 }
 
@@ -448,6 +473,7 @@ void MainWindow::activateProfile(PlaybackProfile profile, bool reopenMedia)
             playbackProfileName(playbackProfile_), playbackProfileName(profile), shouldReopen);
 
     controller_->close();
+    requestedSessionId_ = controller_->openSessionId();
     const bool installed = installRenderer(profile);
     updateProfileActions();
     updateStatusBar();
@@ -457,6 +483,16 @@ void MainWindow::activateProfile(PlaybackProfile profile, bool reopenMedia)
                              3000);
     if (shouldReopen) {
         controller_->open(requestedMediaUrl_);
+        requestedSessionId_ = controller_->openSessionId();
+        updateD3D11RendererSession();
+    }
+}
+
+void MainWindow::updateD3D11RendererSession()
+{
+    auto* d3dRenderer = dynamic_cast<D3D11Renderer*>(renderer_);
+    if (d3dRenderer) {
+        d3dRenderer->setPlaybackSession(requestedSessionId_, requestedMediaUrl_);
     }
 }
 
@@ -477,6 +513,15 @@ bool MainWindow::installRenderer(PlaybackProfile profile)
             installedProfile = PlaybackProfile::Software;
         } else {
             auto* d3dRenderer = new D3D11Renderer(d3d11Context_.get(), videoContainer_);
+            d3dRenderer->setUnsupportedFormatCallback(
+                [this](unsigned long long sessionId, const QUrl& url, const QString& reason) {
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, sessionId, url, reason] {
+                            onD3D11FallbackRequested(sessionId, url, reason);
+                        },
+                        Qt::QueuedConnection);
+                });
             if (d3dRenderer->isReady()) {
                 renderer_ = d3dRenderer;
             } else {
