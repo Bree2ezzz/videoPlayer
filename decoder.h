@@ -77,7 +77,7 @@ public:
              const Options& options = Options());
 
     // 关闭 codecCtx_。调用前必须已 stop()。
-    void close();
+    virtual void close();
 
     // 绑定输入/输出队列。queue 生命周期由上层保证。
     void setInputQueue(PacketQueue* queue);
@@ -184,6 +184,9 @@ class VideoDecoder : public Decoder
 {
 public:
     VideoDecoder();
+    ~VideoDecoder() override;
+
+    void close() override;
 
 protected:
     int configureCodecContext(AVCodecContext* ctx,
@@ -191,6 +194,14 @@ protected:
                               const Options& options) override;
     int handleDecodedFrame(AVFrame* frame, int serial) override;
     void handleCodecDrained() override;
+
+private:
+    static AVPixelFormat getHardwareFormat(AVCodecContext* ctx, const AVPixelFormat* formats);
+    void resetHardwareContext();
+
+    AVBufferRef* hwDeviceCtx_ = nullptr;
+    AVPixelFormat hwPixelFormat_ = AV_PIX_FMT_NONE;
+    AVHWDeviceType hwDeviceType_ = AV_HWDEVICE_TYPE_NONE;
 };
 
 class AudioDecoder : public Decoder

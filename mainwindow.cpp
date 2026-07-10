@@ -2,6 +2,7 @@
 #include "./ui_mainwindow.h"
 
 #include "softwarerenderer.h"
+#include "openglrenderer.h"
 #include "videorendererbase.h"
 
 #include <QAction>
@@ -20,6 +21,7 @@
 #include <QObject>
 #include <QPushButton>
 #include <QSizePolicy>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QStatusBar>
 #include <QVBoxLayout>
@@ -123,6 +125,8 @@ MainWindow::MainWindow(QWidget* parent)
 
     QMenu* rendererMenu = menuBar()->addMenu(QStringLiteral("Renderer"));
     QAction* switchRendererAction = rendererMenu->addAction(QStringLiteral("Switch Renderer"));
+    QAction* hardwareDecodeAction = rendererMenu->addAction(QStringLiteral("Hardware Decoding"));
+    hardwareDecodeAction->setCheckable(true);
 
     QMenu* helpMenu = menuBar()->addMenu(QStringLiteral("Help"));
     QAction* aboutAction = helpMenu->addAction(QStringLiteral("About"));
@@ -133,6 +137,22 @@ MainWindow::MainWindow(QWidget* parent)
     connect(playPauseAction, &QAction::triggered, controller_, &PlaybackController::togglePause);
     connect(fullscreenAction, &QAction::triggered, this, &MainWindow::onToggleFullscreen);
     connect(switchRendererAction, &QAction::triggered, this, &MainWindow::onSwitchRenderer);
+    connect(hardwareDecodeAction, &QAction::toggled, this, [this, hardwareDecodeAction](bool enabled) {
+        if (controller_->isOpen()) {
+            statusBar()->showMessage(QStringLiteral("Close the current media before changing hardware decoding"), 3000);
+            QSignalBlocker blocker(hardwareDecodeAction);
+            hardwareDecodeAction->setChecked(hardwareDecodingEnabled_);
+            return;
+        }
+
+        hardwareDecodingEnabled_ = enabled;
+        controller_->setHardwareDecodingEnabled(enabled);
+        updateStatusBar();
+        statusBar()->showMessage(enabled
+                                     ? QStringLiteral("Hardware decoding enabled")
+                                     : QStringLiteral("Hardware decoding disabled"),
+                                 2000);
+    });
     connect(aboutAction, &QAction::triggered, this, &MainWindow::onAbout);
 
     connect(controller_, &PlaybackController::stateChanged,
@@ -294,7 +314,15 @@ void MainWindow::onSwitchRenderer()
         return;
     }
 
-    statusBar()->showMessage(QStringLiteral("OpenGL renderer is not implemented yet"), 3000);
+    const RendererKind nextKind = rendererKind_ == RendererKind::Software
+                                      ? RendererKind::OpenGL
+                                      : RendererKind::Software;
+    installRenderer(nextKind);
+    updateStatusBar();
+    statusBar()->showMessage(nextKind == RendererKind::OpenGL
+                                 ? QStringLiteral("OpenGL renderer enabled")
+                                 : QStringLiteral("Software renderer enabled"),
+                             2000);
 }
 
 void MainWindow::onToggleFullscreen()
@@ -355,23 +383,32 @@ void MainWindow::onEndOfStream()
 
 void MainWindow::installRenderer(RendererKind kind)
 {
-    if (kind == RendererKind::OpenGL) {
-        statusBar()->showMessage(QStringLiteral("OpenGL renderer is not implemented yet"), 3000);
-        return;
-    }
-
     removeCurrentRenderer();
 
-    rendererKind_ = RendererKind::Software;
-    auto* renderer = new SoftwareRenderer(videoContainer_);
-    renderer_ = renderer;
+    rendererKind_ = kind;
+    if (kind == RendererKind::OpenGL) {
+        renderer_ = new OpenGLRenderer(videoContainer_);
+    } else {
+        renderer_ = new SoftwareRenderer(videoContainer_);
+    }
 
-    if (videoLayout_) {
-        videoLayout_->addWidget(renderer->asWidget());
+    QWidget* widget = renderer_ ? renderer_->asWidget() : nullptr;
+    if (widget) {
+        widget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    }
+
+    if (videoLayout_ && widget) {
+        videoLayout_->addWidget(widget);
     }
 
     if (controller_) {
         controller_->setRenderer(renderer_);
+    }
+
+    if (rendererButton_) {
+        rendererButton_->setText(kind == RendererKind::OpenGL
+                                     ? QStringLiteral("GL")
+                                     : QStringLiteral("SW"));
     }
 }
 
@@ -641,13 +678,16 @@ void MainWindow::updateStatusBar()
 {
     const QString rendererName =
         rendererKind_ == RendererKind::Software ? QStringLiteral("SW") : QStringLiteral("OpenGL");
+    const QString hwDecodeName = hardwareDecodingEnabled_ ? QStringLiteral("HW On")
+                                                          : QStringLiteral("HW Off");
     const QString durationText = controller_->durationSec() < 0.0
                                      ? QStringLiteral("LIVE")
                                      : QStringLiteral("%1s").arg(controller_->durationSec(), 0, 'f', 1);
     const QString text =
-        QStringLiteral("%1 | Renderer: %2 | %3s / %4")
+        QStringLiteral("%1 | Renderer: %2 | %3 | %4s / %5")
             .arg(stateText(controller_->state()))
             .arg(rendererName)
+            .arg(hwDecodeName)
             .arg(controller_->positionSec(), 0, 'f', 1)
             .arg(durationText);
     if (statusLabel_) {

@@ -12,7 +12,7 @@
 - 暂停状态下支持前进/后退逐帧。
 - 打开媒体时使用后台线程执行 FFmpeg 输入探测，避免 UI 冻结。
 - 网络流打开和读取配置超时，断流后按指数退避重连。
-- 视频渲染目前使用软件渲染：FFmpeg frame -> sws_scale -> QImage -> QWidget 绘制。
+- Video rendering supports Software and OpenGL paths: Software uses sws_scale/QImage; OpenGL uploads YUV420P/NV12 textures and converts to RGB in the fragment shader.
 - 音频输出使用 SDL2 callback，音频重采样使用 libswresample。
 - 音视频同步采用 Audio Master：音频时钟作为主时钟，视频侧调整显示时机并丢弃落后帧。
 
@@ -37,6 +37,7 @@ flowchart LR
     CLOCK --> AVS["AVSync"]
     AVS --> RS
     RS --> SR["SoftwareRenderer<br/>QImage/QWidget"]
+    RS --> GLR["OpenGLRenderer<br/>YUV/NV12 textures"]
 ```
 
 ## Source Map
@@ -52,6 +53,7 @@ flowchart LR
 - `renderscheduler.h/.cpp`: 视频显示调度，按源帧率或音频主时钟计算显示时机。
 - `avsync.h/.cpp`: Audio Master 同步策略，参考 ffplay 的 target delay 思路。
 - `softwarerenderer.h/.cpp`: 软件渲染，把 AVFrame 转成 QImage 并在 QWidget 中绘制。
+- `openglrenderer.h/.cpp`: OpenGL renderer for YUV420P/NV12 plane textures and shader-side YUV -> RGB conversion.
 - `networkoptions.h`: RTSP/RTMP/HTTP/HLS 打开参数、超时和重连选项。
 
 ## Build
@@ -77,12 +79,14 @@ cmake --build build-mingw -j 8
 - 打开本地 MP4，UI 在 Opening 阶段不冻结。
 - 播放、暂停、音量、静音、全屏可用。
 - 拖动进度条到前中后多个位置，画面没有旧帧残留，声音能跟上。
+- Switch Software/OpenGL from the Renderer menu or bottom button, then open the same video and compare aspect ratio, color, and seek behavior.
+- Enable Hardware Decoding and play H.264/H.265; unsupported platforms/codecs should fall back to software decoding without failing playback.
 - 暂停后执行 `+1帧` 和 `-1帧`，画面按帧刷新。
 - 打开网络流，断流时能给出错误提示并进入重连流程。
 
 ## Current Limitations
 
-- 当前渲染路径以软件渲染为主，OpenGL renderer 仍是后续扩展方向。
+- OpenGL renderer is implemented. Hardware-decoded frames are currently transferred back to system memory before texture upload; platform zero-copy presentation remains a future optimization.
 - 主界面采用 Qt Widgets；仓库中的 QML 控件和图标资源尚未接入当前构建。
 - CMake 依赖路径仍偏本机环境，跨机器构建时需要调整。
 - 当前验证以手动功能场景为主，后续可补充核心模块的自动化测试。

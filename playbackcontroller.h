@@ -92,6 +92,8 @@ public:
     // 在 open() 之前调用。允许 nullptr（无视频输出，只放音频）。
     // 切换渲染器需要先 close()。
     void setRenderer(VideoRendererBase* renderer);
+    void setHardwareDecodingEnabled(bool enabled);
+    bool hardwareDecodingEnabled() const;
 
     // ---------- 生命周期 ----------
     // 异步打开。UI 立即返回，最终结果通过 stateChanged() / errorOccurred() 通知。
@@ -271,6 +273,7 @@ private:
     std::atomic<float> volume_{1.0f};
     std::atomic_bool muted_{false};
     std::atomic<float> playbackRate_{1.0f};
+    std::atomic_bool hardwareDecodingEnabled_{false};
     std::atomic_bool renderStepAfterSeek_{false};
     bool livePausedByStop_ = false;
     int reconnectAttempts_ = 0;

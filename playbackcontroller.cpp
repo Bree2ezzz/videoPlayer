@@ -98,6 +98,17 @@ NetworkOptions networkOptionsForUrl(const QUrl& url)
     return options;
 }
 
+AVHWDeviceType defaultHardwareDeviceType()
+{
+#if defined(_WIN32)
+    return AV_HWDEVICE_TYPE_D3D11VA;
+#elif defined(__APPLE__)
+    return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+#else
+    return AV_HWDEVICE_TYPE_VAAPI;
+#endif
+}
+
 int reconnectDelayMs(int attempt)
 {
     if (attempt <= 1) {
@@ -175,6 +186,16 @@ void PlaybackController::setRenderer(VideoRendererBase* renderer)
     if (renderScheduler_) {
         renderScheduler_->setRenderer(renderer_);
     }
+}
+
+void PlaybackController::setHardwareDecodingEnabled(bool enabled)
+{
+    hardwareDecodingEnabled_.store(enabled);
+}
+
+bool PlaybackController::hardwareDecodingEnabled() const
+{
+    return hardwareDecodingEnabled_.load();
 }
 
 void PlaybackController::open(const QUrl& url)
@@ -815,7 +836,13 @@ bool PlaybackController::openDecoders()
         videoFrameQueue_ = std::make_unique<FrameQueue>();
         videoDecoder_ = std::make_unique<VideoDecoder>();
 
-        int ret = videoDecoder_->open(stream);
+        Decoder::Options videoOptions;
+        videoOptions.enableHardware = hardwareDecodingEnabled_.load();
+        videoOptions.hwDeviceType = videoOptions.enableHardware
+                                        ? defaultHardwareDeviceType()
+                                        : AV_HWDEVICE_TYPE_NONE;
+
+        int ret = videoDecoder_->open(stream, videoOptions);
         if (ret < 0) {
             enterError(ret, QStringLiteral("VideoDecoder open failed: ") + avErrorString(ret));
             return false;

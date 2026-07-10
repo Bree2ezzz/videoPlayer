@@ -103,6 +103,7 @@ private:
     PlaybackController* controller_ = nullptr;
     VideoRendererBase* renderer_ = nullptr;
     RendererKind rendererKind_ = RendererKind::Software;
+    bool hardwareDecodingEnabled_ = false;
 
     // ---------- UI 节点 ----------
     QWidget* videoContainer_ = nullptr;     // 中央上半部分：只承载视频渲染器

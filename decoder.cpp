@@ -4,6 +4,7 @@
 
 extern "C" {
 #include <libavutil/error.h>
+#include <libavutil/pixdesc.h>
 }
 
 #include <cerrno>
@@ -13,6 +14,48 @@ extern "C" {
 #include <utility>
 
 namespace {
+
+
+AVPixelFormat hardwarePixelFormatForDevice(AVHWDeviceType type)
+{
+    switch (type) {
+    case AV_HWDEVICE_TYPE_D3D11VA:
+        return AV_PIX_FMT_D3D11;
+    case AV_HWDEVICE_TYPE_DXVA2:
+        return AV_PIX_FMT_DXVA2_VLD;
+    case AV_HWDEVICE_TYPE_VAAPI:
+        return AV_PIX_FMT_VAAPI;
+    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+        return AV_PIX_FMT_VIDEOTOOLBOX;
+    case AV_HWDEVICE_TYPE_CUDA:
+        return AV_PIX_FMT_CUDA;
+    case AV_HWDEVICE_TYPE_QSV:
+        return AV_PIX_FMT_QSV;
+    default:
+        return AV_PIX_FMT_NONE;
+    }
+}
+
+bool isHardwarePixelFormat(AVPixelFormat format)
+{
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(format);
+    return desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL);
+}
+
+AVPixelFormat firstSoftwarePixelFormat(const AVPixelFormat* formats)
+{
+    if (!formats) {
+        return AV_PIX_FMT_NONE;
+    }
+
+    for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p) {
+        if (!isHardwarePixelFormat(*p)) {
+            return *p;
+        }
+    }
+
+    return formats[0];
+}
 
 std::string avErrorString(int errCode)
 {
@@ -263,10 +306,6 @@ int Decoder::configureCodecContext(AVCodecContext* ctx,
         ctx->thread_count = options.threadCount;
     }
 
-    if (options.enableHardware) {
-        return AVERROR(ENOSYS);
-    }
-
     return 0;
 }
 
@@ -484,6 +523,17 @@ VideoDecoder::VideoDecoder()
 {
 }
 
+VideoDecoder::~VideoDecoder()
+{
+    close();
+}
+
+void VideoDecoder::close()
+{
+    Decoder::close();
+    resetHardwareContext();
+}
+
 int VideoDecoder::configureCodecContext(AVCodecContext* ctx,
                                         const AVCodec* codec,
                                         const Options& options)
@@ -498,17 +548,111 @@ int VideoDecoder::configureCodecContext(AVCodecContext* ctx,
     }
 
     ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
+    resetHardwareContext();
+    if (!options.enableHardware || options.hwDeviceType == AV_HWDEVICE_TYPE_NONE) {
+        return 0;
+    }
+
+    const AVPixelFormat hwFormat = hardwarePixelFormatForDevice(options.hwDeviceType);
+    if (hwFormat == AV_PIX_FMT_NONE) {
+        VP_LOG_WARN() << "unsupported hardware device type="
+                      << av_hwdevice_get_type_name(options.hwDeviceType)
+                      << "; falling back to software decode";
+        return 0;
+    }
+
+    ret = av_hwdevice_ctx_create(&hwDeviceCtx_, options.hwDeviceType, nullptr, nullptr, 0);
+    if (ret < 0) {
+        VP_LOG_WARN() << "av_hwdevice_ctx_create failed for "
+                      << av_hwdevice_get_type_name(options.hwDeviceType)
+                      << ": " << avErrorString(ret)
+                      << "; falling back to software decode";
+        resetHardwareContext();
+        return 0;
+    }
+
+    ctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
+    if (!ctx->hw_device_ctx) {
+        resetHardwareContext();
+        return 0;
+    }
+
+    ctx->opaque = this;
+    ctx->get_format = &VideoDecoder::getHardwareFormat;
+    hwPixelFormat_ = hwFormat;
+    hwDeviceType_ = options.hwDeviceType;
+    VP_LOG_INFO() << "hardware decode enabled device="
+                  << av_hwdevice_get_type_name(hwDeviceType_)
+                  << " pixfmt=" << av_get_pix_fmt_name(hwPixelFormat_);
     return 0;
 }
 
 int VideoDecoder::handleDecodedFrame(AVFrame* frame, int serial)
 {
-    return Decoder::handleDecodedFrame(frame, serial);
+    if (!frame) {
+        return AVERROR(EINVAL);
+    }
+
+    const AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
+    if (!isHardwarePixelFormat(format)) {
+        return Decoder::handleDecodedFrame(frame, serial);
+    }
+
+    AVFrame* swFrame = av_frame_alloc();
+    if (!swFrame) {
+        return AVERROR(ENOMEM);
+    }
+
+    int ret = av_hwframe_transfer_data(swFrame, frame, 0);
+    if (ret < 0) {
+        reportError(ret, "av_hwframe_transfer_data failed: " + avErrorString(ret));
+        av_frame_free(&swFrame);
+        return ret;
+    }
+
+    ret = av_frame_copy_props(swFrame, frame);
+    if (ret < 0) {
+        reportError(ret, "av_frame_copy_props failed: " + avErrorString(ret));
+        av_frame_free(&swFrame);
+        return ret;
+    }
+
+    ret = Decoder::handleDecodedFrame(swFrame, serial);
+    av_frame_free(&swFrame);
+    return ret;
 }
 
 void VideoDecoder::handleCodecDrained()
 {
     Decoder::handleCodecDrained();
+}
+
+AVPixelFormat VideoDecoder::getHardwareFormat(AVCodecContext* ctx, const AVPixelFormat* formats)
+{
+    auto* decoder = ctx ? static_cast<VideoDecoder*>(ctx->opaque) : nullptr;
+    if (decoder && decoder->hwPixelFormat_ != AV_PIX_FMT_NONE) {
+        for (const AVPixelFormat* p = formats; p && *p != AV_PIX_FMT_NONE; ++p) {
+            if (*p == decoder->hwPixelFormat_) {
+                return *p;
+            }
+        }
+
+        VP_LOG_WARN() << "decoder did not offer requested hardware pixfmt="
+                      << av_get_pix_fmt_name(decoder->hwPixelFormat_)
+                      << "; falling back to software format";
+    }
+
+    return firstSoftwarePixelFormat(formats);
+}
+
+void VideoDecoder::resetHardwareContext()
+{
+    if (hwDeviceCtx_) {
+        av_buffer_unref(&hwDeviceCtx_);
+    }
+    hwPixelFormat_ = AV_PIX_FMT_NONE;
+    hwDeviceType_ = AV_HWDEVICE_TYPE_NONE;
 }
 
 AudioDecoder::AudioDecoder()
