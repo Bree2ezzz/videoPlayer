@@ -246,14 +246,22 @@ void PlaybackController::setRenderer(VideoRendererBase* renderer)
     }
 }
 
-void PlaybackController::setHardwareDecodingEnabled(bool enabled)
+void PlaybackController::setPlaybackProfile(PlaybackProfile profile, D3D11Context* sharedD3D11)
 {
-    hardwareDecodingEnabled_.store(enabled);
+    if (state() != State::Idle && state() != State::Error) {
+        VP_WARN("ignoring profile change while state={} requested_profile={}",
+                stateName(state()), static_cast<int>(profile));
+        return;
+    }
+    playbackProfile_ = profile;
+    sharedD3D11_ = profile == PlaybackProfile::D3D11 ? sharedD3D11 : nullptr;
+    VP_INFO("playback profile configured profile={} d3d11_context={}",
+            static_cast<int>(playbackProfile_), static_cast<const void*>(sharedD3D11_));
 }
 
-bool PlaybackController::hardwareDecodingEnabled() const
+PlaybackProfile PlaybackController::playbackProfile() const
 {
-    return hardwareDecodingEnabled_.load();
+    return playbackProfile_;
 }
 
 void PlaybackController::open(const QUrl& url)
@@ -646,6 +654,13 @@ void PlaybackController::handleAudioEofFromModule()
 void PlaybackController::handleErrorFromModule(int errCode, const QString& msg)
 {
     VP_ERROR("module error code={} msg={}", errCode, qStringForLog(msg));
+    if (playbackProfile_ == PlaybackProfile::D3D11 &&
+        errCode == AVERROR(ENOSYS) &&
+        msg.startsWith(QStringLiteral("VideoDecoder:"))) {
+        requestD3D11Fallback(
+            QStringLiteral("FFmpeg selected a software video frame format for this codec"));
+        return;
+    }
     if (scheduleReconnect(errCode, msg)) {
         return;
     }
@@ -919,6 +934,19 @@ bool PlaybackController::openDemuxer(const QUrl& url)
     return true;
 }
 
+void PlaybackController::requestD3D11Fallback(const QString& reason)
+{
+    if (playbackProfile_ != PlaybackProfile::D3D11) {
+        return;
+    }
+
+    VP_WARN("D3D11 profile fallback requested: {}", qStringForLog(reason));
+    QMetaObject::invokeMethod(
+        this,
+        [this, reason] { emit d3d11FallbackRequested(reason); },
+        Qt::QueuedConnection);
+}
+
 bool PlaybackController::openDecoders()
 {
     if (videoStreamIndex_ >= 0 && renderer_) {
@@ -928,23 +956,41 @@ bool PlaybackController::openDecoders()
             return false;
         }
 
+        const bool useD3D11 = playbackProfile_ == PlaybackProfile::D3D11;
+        if (useD3D11 && !sharedD3D11_) {
+            requestD3D11Fallback(QStringLiteral("The shared D3D11 device is unavailable"));
+            return false;
+        }
+
         videoPacketQueue_ = std::make_unique<PacketQueue>();
-        videoFrameQueue_ = std::make_unique<FrameQueue>();
+        // D3D11 decoder surfaces are a finite texture array. Keep only a few references queued.
+        videoFrameQueue_ = std::make_unique<FrameQueue>(useD3D11 ? 4 : 16);
         videoDecoder_ = std::make_unique<VideoDecoder>();
 
-        VP_INFO("opening video decoder stream={} codec_id={}",
-                videoStreamIndex_, stream->codecpar ? static_cast<int>(stream->codecpar->codec_id) : -1);
+        VP_INFO("opening video decoder stream={} codec_id={} profile={}",
+                videoStreamIndex_,
+                stream->codecpar ? static_cast<int>(stream->codecpar->codec_id) : -1,
+                static_cast<int>(playbackProfile_));
 
         Decoder::Options videoOptions;
-        videoOptions.enableHardware = hardwareDecodingEnabled_.load();
-        videoOptions.hwDeviceType = videoOptions.enableHardware
+        videoOptions.enableHardware = useD3D11;
+        videoOptions.hwDeviceType = useD3D11
                                         ? defaultHardwareDeviceType()
                                         : AV_HWDEVICE_TYPE_NONE;
+        videoOptions.sharedD3D11 = useD3D11 ? sharedD3D11_ : nullptr;
 
-        VP_INFO("video decoder options stream={} hw_enabled={} hw_device={}",
-                videoStreamIndex_, videoOptions.enableHardware, static_cast<int>(videoOptions.hwDeviceType));
+        VP_INFO("video decoder options stream={} hw_enabled={} hw_device={} shared_d3d11={}",
+                videoStreamIndex_,
+                videoOptions.enableHardware,
+                static_cast<int>(videoOptions.hwDeviceType),
+                static_cast<const void*>(videoOptions.sharedD3D11));
         int ret = videoDecoder_->open(stream, videoOptions);
         if (ret < 0) {
+            if (useD3D11) {
+                requestD3D11Fallback(
+                    QStringLiteral("D3D11 VideoDecoder open failed: ") + avErrorString(ret));
+                return false;
+            }
             enterError(ret, QStringLiteral("VideoDecoder open failed: ") + avErrorString(ret));
             return false;
         }

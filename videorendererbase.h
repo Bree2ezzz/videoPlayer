@@ -13,10 +13,9 @@ class QWidget;
  * VideoRendererBase 是渲染层的抽象接口。
  *
  * 设计动机：
- *   后续需要支持两种渲染实现（SoftwareRenderer 基于 QImage / CPU，
- *   OpenGLRenderer 基于 QOpenGLWidget / GPU）。两者都要嵌入 Qt 窗口，
- *   但各自继承的 Qt 基类不同（QWidget vs QOpenGLWidget），为避免菱形
- *   继承，本接口不继承 QWidget，具体 widget 通过 asWidget() 暴露。
+ *   支持 SoftwareRenderer（QImage / CPU）和 D3D11Renderer（DXGI / GPU）。
+ *   实现不需要继承同一个 Qt 基类，因此通过 asWidget() 暴露实际承载画面的
+ *   QWidget。
  *
  * 职责边界：
  *   - 接收 AVFrame 并显示（可能被任意线程调用，实现必须线程安全）
@@ -46,7 +45,7 @@ public:
     virtual QWidget* asWidget() = 0;
 
     // 返回当前渲染器能直接处理的像素格式首选项；
-    // 当前两种实现都以 YUV420P 作为内部格式，不需要 sws 转换时性能最好。
+    // Software profile 返回 YUV420P；D3D11 profile 返回 AV_PIX_FMT_D3D11。
     virtual int preferredPixelFormat() const = 0;
 };
 

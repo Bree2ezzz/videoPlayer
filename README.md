@@ -1,20 +1,17 @@
 # Qt/FFmpeg Video Player
 
-这是一个基于 Qt Widgets、FFmpeg 和 SDL2 的桌面视频播放器个人项目。项目重点放在播放器核心链路：解封装、解码、音频输出、视频渲染调度、播放控制、seek 边界处理、音视频同步和网络流异常恢复。
+一个基于 Qt Widgets、FFmpeg 与 SDL2 的桌面音视频播放器。项目将解封装、解码、音频输出、视频调度、音视频同步和网络重连拆分为独立模块，并通过带 serial 的有界队列处理 seek 后的新旧数据边界。
 
-当前版本支持本地文件播放，以及 RTSP / RTMP / HLS / HTTP-FLV 等常见网络输入；播放管线采用多线程模块拆分，通过 Packet / Frame 两级有界队列进行线程间解耦，并使用 serial 机制处理 seek 后的新旧数据边界。
+## Rendering Profiles
 
-## Features
+播放器在打开媒体前选择并固定一个 profile。切换 profile 会停止当前管线、销毁 renderer 与解码器，并在有媒体时重新打开 URL；不支持在同一条播放管线内临时切换。
 
-- 打开本地媒体文件。
-- 打开 RTSP、RTMP/RTMPS、HLS、HTTP-FLV、HTTP/HTTPS 媒体 URL。
-- 播放、暂停、进度跳转、音量、静音、全屏、倍速。
-- 暂停状态下支持前进/后退逐帧。
-- 打开媒体时使用后台线程执行 FFmpeg 输入探测，避免 UI 冻结。
-- 网络流打开和读取配置超时，断流后按指数退避重连。
-- Video rendering supports Software and OpenGL paths: Software uses sws_scale/QImage; OpenGL uploads YUV420P/NV12 textures and converts to RGB in the fragment shader.
-- Audio output uses SDL2 callback; libswresample converts to the device format, and FFmpeg atempo provides tempo change without pitch shift.
-- 音视频同步采用 Audio Master：音频时钟作为主时钟，视频侧调整显示时机并丢弃落后帧。
+- `Software`: CPU 软解 + `SoftwareRenderer`（`sws_scale` 到 `QImage`）。这是跨平台兜底路径。
+- `D3D11`: Windows 路径。应用创建一个带 `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` 的共享 device，FFmpeg 的 D3D11VA 解码器与 `D3D11Renderer` 共用它。解码帧保留在 GPU，renderer 从解码纹理数组的对应 slice 用 `CopySubresourceRegion` 拷到可采样 NV12 纹理，经 HLSL 做 YUV-to-RGB 转换后交给 DXGI swap chain 呈现。
+
+D3D11 device 创建、FFmpeg 硬件设备初始化或 codec 的 D3D11 格式协商失败时，播放器会自动重建为 `Software` profile 并重新打开当前媒体。D3D11 profile 的视频 `FrameQueue` 容量为 4，避免持有过多解码 surface；软件 profile 保持默认容量 16。
+
+共享 immediate context 同时启用了 `ID3D11Multithread::SetMultithreadProtected(TRUE)`，且 FFmpeg 的 `lock` / `unlock` 回调与 renderer 共用 `D3D11Context` 的 mutex，避免解码线程与 GUI 呈现线程并发访问 device context。
 
 ## Architecture
 
@@ -22,73 +19,54 @@
 flowchart LR
     UI["MainWindow / Qt Widgets"] --> PC["PlaybackController"]
     PC --> OW["Open worker thread"]
-    OW --> DOPEN["Demuxer::open<br/>avformat_open_input<br/>avformat_find_stream_info"]
-    DOPEN --> PC
-    PC --> D["Demuxer read thread"]
-    D --> VPQ["video PacketQueue"]
-    D --> APQ["audio PacketQueue"]
+    OW --> DMX["Demuxer"]
+    DMX --> VPQ["video PacketQueue"]
+    DMX --> APQ["audio PacketQueue"]
     VPQ --> VD["VideoDecoder thread"]
     APQ --> AD["AudioDecoder thread"]
     VD --> VFQ["video FrameQueue"]
     AD --> AFQ["audio FrameQueue"]
-    AFQ --> AO["AudioOutput<br/>SDL callback"]
-    AO --> CLOCK["audio clock"]
+    AFQ --> AO["AudioOutput / SDL callback"]
+    AO --> SYNC["AVSync audio clock"]
     VFQ --> RS["RenderScheduler thread"]
-    CLOCK --> AVS["AVSync"]
-    AVS --> RS
-    RS --> SR["SoftwareRenderer<br/>QImage/QWidget"]
-    RS --> GLR["OpenGLRenderer<br/>YUV/NV12 textures"]
+    SYNC --> RS
+    RS --> PROFILE{"Playback profile"}
+    PROFILE --> SW["SoftwareRenderer / QImage"]
+    PROFILE --> D3D["D3D11Renderer / DXGI swap chain"]
+    D3D --> GPU["Shared D3D11 device"]
+    VD --> GPU
 ```
 
 ## Source Map
 
-- `main.cpp`: 初始化 SDL audio、FFmpeg network、Qt 应用和日志规则。
-- `mainwindow.h/.cpp`: 窗口、菜单、底部控制栏、Opening 覆盖提示、状态栏和用户输入。
-- `playbackcontroller.h/.cpp`: 播放状态机和模块编排，负责 open/close/play/pause/seek/reconnect。
-- `demuxer.h/.cpp`: FFmpeg 输入打开、流选择、读 packet 线程、网络选项和 seek。
-- `decoder.h/.cpp`: 音频/视频解码线程，消费 PacketQueue，输出 FrameQueue。
-- `PacketQueue.h`: packet 有界队列，带 serial，用于识别 seek 后的新旧数据边界。
-- `FrameQueue.h`: frame 有界队列，frame 入队时携带 packet serial。
-- `audiooutput.h/.cpp`: SDL2 audio device, resampling, volume, atempo-based tempo change without pitch shift, and audio clock.
-- `renderscheduler.h/.cpp`: 视频显示调度，按源帧率或音频主时钟计算显示时机。
-- `avsync.h/.cpp`: Audio Master 同步策略，参考 ffplay 的 target delay 思路。
-- `softwarerenderer.h/.cpp`: 软件渲染，把 AVFrame 转成 QImage 并在 QWidget 中绘制。
-- `openglrenderer.h/.cpp`: OpenGL renderer for YUV420P/NV12 plane textures and shader-side YUV -> RGB conversion.
-- `networkoptions.h`: RTSP/RTMP/HTTP/HLS 打开参数、超时和重连选项。
+- `mainwindow.h/.cpp`: Qt window, controls, profile selection and profile rebuild.
+- `playbackcontroller.h/.cpp`: playback state machine, module lifetime, D3D11-to-software fallback and queue sizing.
+- `demuxer.h/.cpp`: FFmpeg input opening, stream selection, packet reader, network options and seek.
+- `decoder.h/.cpp`: decoder threads; `VideoDecoder` imports the app-owned D3D11 device and forwards hardware frames unchanged.
+- `d3d11context.h/.cpp`: shared D3D11 device, immediate context and synchronization lock.
+- `d3d11renderer.h/.cpp`: native Qt child window, DXGI swap chain, GPU NV12 copy and HLSL rendering.
+- `softwarerenderer.h/.cpp`: software fallback renderer.
+- `PacketQueue.h` / `FrameQueue.h`: bounded packet/frame queues carrying seek serials.
+- `audiooutput.h/.cpp`, `renderscheduler.h/.cpp`, `avsync.h/.cpp`: audio playback, video scheduling and audio-master synchronization.
 
 ## Build
 
-当前 `CMakeLists.txt` 使用本机开发环境中的 FFmpeg 和 SDL2 路径：
+The project is Windows-only because the primary GPU profile links Direct3D 11. `CMakeLists.txt` links `d3d11`, `dxgi` and `d3dcompiler`, with Qt Widgets as the only Qt module dependency.
+
+The current local dependency paths are:
 
 - `D:/ffmpeg`
 - `D:/SDL2-devel-2.30.5-mingw/SDL2-2.30.5/x86_64-w64-mingw32`
-
-本机验证命令：
 
 ```powershell
 D:\qt\6.7.2\mingw_64\bin\qt-cmake.bat -S . -B build-mingw -G "MinGW Makefiles"
 cmake --build build-mingw -j 8
 ```
 
-如果换机器构建，需要先安装 Qt 6 MinGW、FFmpeg development package 和 SDL2 development package，并按本机环境调整 CMake 中的依赖路径。
-
 ## Manual Verification
 
-核心验证项：
-
-- 打开本地 MP4，UI 在 Opening 阶段不冻结。
-- 播放、暂停、音量、静音、全屏可用。
-- 拖动进度条到前中后多个位置，画面没有旧帧残留，声音能跟上。
-- Switch Software/OpenGL from the Renderer menu or bottom button, then open the same video and compare aspect ratio, color, and seek behavior.
-- Enable Hardware Decoding and play H.264/H.265; unsupported platforms/codecs should fall back to software decoding without failing playback.
-- Check 0.5x / 1.0x / 1.5x / 2.0x playback: tempo should change while pitch stays natural.
-- Seek while playing at non-1.0x speed; old audio should not leak from the tempo filter buffer.
-- 暂停后执行 `+1帧` 和 `-1帧`，画面按帧刷新。
-- 打开网络流，断流时能给出错误提示并进入重连流程。
-
-## Current Limitations
-
-- OpenGL renderer is implemented. Hardware-decoded frames are currently transferred back to system memory before texture upload; platform zero-copy presentation remains a future optimization.
-- 主界面采用 Qt Widgets；仓库中的 QML 控件和图标资源尚未接入当前构建。
-- CMake 依赖路径仍偏本机环境，跨机器构建时需要调整。
-- 当前验证以手动功能场景为主，后续可补充核心模块的自动化测试。
+- Verify normal playback, pause, seek, frame stepping, speed change and fullscreen in both profiles.
+- In D3D11 profile, play H.264/H.265 at 1080p and 4K; verify aspect ratio, BT.601/BT.709 color, resize and seek behavior.
+- Play for several minutes and seek repeatedly in D3D11 profile to confirm decoder surfaces are not exhausted.
+- On a machine without usable D3D11VA or with an unsupported codec, verify the player switches to Software and continues opening the same media.
+- Compare CPU use for the same 4K media in both profiles; D3D11 should avoid GPU-to-CPU frame download.

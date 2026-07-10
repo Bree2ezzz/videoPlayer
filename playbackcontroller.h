@@ -20,8 +20,14 @@ class AVSync;
 class VideoRendererBase;
 class PacketQueue;
 class FrameQueue;
+class D3D11Context;
 
 class QTimer;
+
+enum class PlaybackProfile {
+    Software,
+    D3D11,
+};
 
 /*
  * PlaybackController 职责边界：
@@ -35,7 +41,7 @@ class QTimer;
  *
  * 设计说明：
  *   - 不渲染、不解码、不解封装；这些工作交给被持有的子模块。
- *   - 不拥有 VideoRendererBase（由 UI/MainWindow 注入），便于切换软件 / OpenGL 渲染。
+ *   - 不拥有 VideoRendererBase（由 UI/MainWindow 注入），便于切换软件 / D3D11 渲染。
  *   - open / seek 都是异步：UI 立即返回，结果通过 signal 通知。状态机串行
  *     执行，避免半开状态。
  *   - 所有模块层回调都在内部 trampoline 中通过 QMetaObject::invokeMethod
@@ -92,8 +98,9 @@ public:
     // 在 open() 之前调用。允许 nullptr（无视频输出，只放音频）。
     // 切换渲染器需要先 close()。
     void setRenderer(VideoRendererBase* renderer);
-    void setHardwareDecodingEnabled(bool enabled);
-    bool hardwareDecodingEnabled() const;
+    // Profile is fixed for one open cycle. MainWindow must close before changing it.
+    void setPlaybackProfile(PlaybackProfile profile, D3D11Context* sharedD3D11 = nullptr);
+    PlaybackProfile playbackProfile() const;
 
     // ---------- 生命周期 ----------
     // 异步打开。UI 立即返回，最终结果通过 stateChanged() / errorOccurred() 通知。
@@ -171,6 +178,9 @@ signals:
     // seek 完成（state 已经回到 seek 前的 Playing/Paused）
     void seekFinished();
 
+    // D3D11 device setup or codec format negotiation failed; UI rebuilds the Software profile.
+    void d3d11FallbackRequested(const QString& reason);
+
 public slots:
     // UI 拖动进度条结束时调用：等价于 seek(positionSec)
     void requestSeek(double positionSec);
@@ -207,6 +217,7 @@ private:
     // 装配阶段细分，便于失败定位
     bool openDemuxer(const QUrl& url);
     bool openDecoders();           // 视频 + 音频
+    void requestD3D11Fallback(const QString& reason);
     bool openAudioOutput();        // 音频流不存在时跳过
     bool wireScheduler();          // 绑定 timeBase / sync / renderer
 
@@ -246,6 +257,8 @@ private:
 
     // ---------- 渲染器（不拥有） ----------
     VideoRendererBase* renderer_ = nullptr;
+    PlaybackProfile playbackProfile_ = PlaybackProfile::Software;
+    D3D11Context* sharedD3D11_ = nullptr; // owned by MainWindow; outlives this pipeline
 
     // ---------- 媒体描述（open 成功后填充） ----------
     QUrl currentUrl_;
@@ -273,7 +286,6 @@ private:
     std::atomic<float> volume_{1.0f};
     std::atomic_bool muted_{false};
     std::atomic<float> playbackRate_{1.0f};
-    std::atomic_bool hardwareDecodingEnabled_{false};
     std::atomic_bool renderStepAfterSeek_{false};
     bool livePausedByStop_ = false;
     int reconnectAttempts_ = 0;

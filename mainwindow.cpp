@@ -4,10 +4,12 @@
 #include "./ui_mainwindow.h"
 
 #include "softwarerenderer.h"
-#include "openglrenderer.h"
+#include "d3d11context.h"
+#include "d3d11renderer.h"
 #include "videorendererbase.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QCloseEvent>
 #include <QEvent>
 #include <QFileDialog>
@@ -23,7 +25,6 @@
 #include <QObject>
 #include <QPushButton>
 #include <QSizePolicy>
-#include <QSignalBlocker>
 #include <QSlider>
 #include <QStatusBar>
 #include <QVBoxLayout>
@@ -41,13 +42,13 @@ namespace {
 
 constexpr int kProgressSliderScale = 1000;
 
-const char* rendererKindName(int kind)
+const char* playbackProfileName(PlaybackProfile profile)
 {
-    switch (kind) {
-    case 0:
+    switch (profile) {
+    case PlaybackProfile::Software:
         return "Software";
-    case 1:
-        return "OpenGL";
+    case PlaybackProfile::D3D11:
+        return "D3D11";
     }
     return "Unknown";
 }
@@ -127,7 +128,7 @@ MainWindow::MainWindow(QWidget* parent)
     videoLayout_->setContentsMargins(0, 0, 0, 0);
     videoLayout_->setSpacing(0);
 
-    installRenderer(RendererKind::Software);
+    installRenderer(PlaybackProfile::Software);
 
     openingLabel_ = new QLabel(QStringLiteral("Opening media..."), videoContainer_);
     openingLabel_->setAlignment(Qt::AlignCenter);
@@ -152,9 +153,14 @@ MainWindow::MainWindow(QWidget* parent)
     QAction* fullscreenAction = playbackMenu->addAction(QStringLiteral("Fullscreen"));
 
     QMenu* rendererMenu = menuBar()->addMenu(QStringLiteral("Renderer"));
-    QAction* switchRendererAction = rendererMenu->addAction(QStringLiteral("Switch Renderer"));
-    QAction* hardwareDecodeAction = rendererMenu->addAction(QStringLiteral("Hardware Decoding"));
-    hardwareDecodeAction->setCheckable(true);
+    softwareProfileAction_ = rendererMenu->addAction(QStringLiteral("Software Decode + Render"));
+    d3d11ProfileAction_ = rendererMenu->addAction(QStringLiteral("D3D11 Hardware Decode + Render"));
+    softwareProfileAction_->setCheckable(true);
+    d3d11ProfileAction_->setCheckable(true);
+    auto* profileActions = new QActionGroup(rendererMenu);
+    profileActions->setExclusive(true);
+    profileActions->addAction(softwareProfileAction_);
+    profileActions->addAction(d3d11ProfileAction_);
 
     QMenu* helpMenu = menuBar()->addMenu(QStringLiteral("Help"));
     QAction* aboutAction = helpMenu->addAction(QStringLiteral("About"));
@@ -164,27 +170,15 @@ MainWindow::MainWindow(QWidget* parent)
     connect(exitAction, &QAction::triggered, this, &QWidget::close);
     connect(playPauseAction, &QAction::triggered, controller_, &PlaybackController::togglePause);
     connect(fullscreenAction, &QAction::triggered, this, &MainWindow::onToggleFullscreen);
-    connect(switchRendererAction, &QAction::triggered, this, &MainWindow::onSwitchRenderer);
-    connect(hardwareDecodeAction, &QAction::toggled, this, [this, hardwareDecodeAction](bool enabled) {
-        VP_INFO("hardware decoding toggle requested enabled={} current={} renderer={} is_open={}",
-                enabled, hardwareDecodingEnabled_, rendererKindName(static_cast<int>(rendererKind_)), controller_->isOpen());
-        if (controller_->isOpen()) {
-            VP_WARN("hardware decoding toggle blocked because media is open renderer={} requested={}",
-                    rendererKindName(static_cast<int>(rendererKind_)), enabled);
-            statusBar()->showMessage(QStringLiteral("Close the current media before changing hardware decoding"), 3000);
-            QSignalBlocker blocker(hardwareDecodeAction);
-            hardwareDecodeAction->setChecked(hardwareDecodingEnabled_);
-            return;
+    connect(softwareProfileAction_, &QAction::triggered, this, [this](bool checked) {
+        if (checked) {
+            activateProfile(PlaybackProfile::Software, true);
         }
-
-        hardwareDecodingEnabled_ = enabled;
-        VP_INFO("hardware decoding changed enabled={} renderer={}", enabled, rendererKindName(static_cast<int>(rendererKind_)));
-        controller_->setHardwareDecodingEnabled(enabled);
-        updateStatusBar();
-        statusBar()->showMessage(enabled
-                                     ? QStringLiteral("Hardware decoding enabled")
-                                     : QStringLiteral("Hardware decoding disabled"),
-                                 2000);
+    });
+    connect(d3d11ProfileAction_, &QAction::triggered, this, [this](bool checked) {
+        if (checked) {
+            activateProfile(PlaybackProfile::D3D11, true);
+        }
     });
     connect(aboutAction, &QAction::triggered, this, &MainWindow::onAbout);
 
@@ -198,6 +192,8 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onErrorOccurred);
     connect(controller_, &PlaybackController::endOfStream,
             this, &MainWindow::onEndOfStream);
+    connect(controller_, &PlaybackController::d3d11FallbackRequested,
+            this, &MainWindow::onD3D11FallbackRequested);
     connect(controller_, &PlaybackController::volumeChanged,
             this, [this](float volume) {
                 updateVolumeControls(volume, controller_->isMuted());
@@ -212,6 +208,7 @@ MainWindow::MainWindow(QWidget* parent)
     statusLabel_ = new QLabel(statusBar());
     statusLabel_->setMinimumWidth(260);
     statusBar()->addPermanentWidget(statusLabel_, 1);
+    updateProfileActions();
     updateStatusBar();
     updateOpeningIndicator();
 }
@@ -227,16 +224,16 @@ MainWindow::~MainWindow()
 
 void MainWindow::openMedia(const QUrl& url)
 {
-    VP_INFO("MainWindow::openMedia url={} renderer={} renderer_ptr={} hardware_decode={}",
+    VP_INFO("MainWindow::openMedia url={} profile={} renderer_ptr={}",
             urlForLog(url),
-            rendererKindName(static_cast<int>(rendererKind_)),
-            static_cast<const void*>(renderer_),
-            hardwareDecodingEnabled_);
+            playbackProfileName(playbackProfile_),
+            static_cast<const void*>(renderer_));
     if (!url.isValid() || url.isEmpty()) {
         VP_WARN("MainWindow::openMedia ignored invalid url={}", urlForLog(url));
         return;
     }
 
+    requestedMediaUrl_ = url;
     controller_->open(url);
 }
 
@@ -348,26 +345,10 @@ void MainWindow::onOpenUrl()
 
 void MainWindow::onSwitchRenderer()
 {
-    VP_INFO("renderer switch requested current={} renderer_ptr={} is_open={}",
-            rendererKindName(static_cast<int>(rendererKind_)),
-            static_cast<const void*>(renderer_),
-            controller_->isOpen());
-    if (controller_->isOpen()) {
-        VP_WARN("renderer switch blocked because media is open current={}", rendererKindName(static_cast<int>(rendererKind_)));
-        statusBar()->showMessage(QStringLiteral("Close the current media before switching renderer"), 3000);
-        return;
-    }
-
-    const RendererKind nextKind = rendererKind_ == RendererKind::Software
-                                      ? RendererKind::OpenGL
-                                      : RendererKind::Software;
-    VP_INFO("renderer switch installing next={}", rendererKindName(static_cast<int>(nextKind)));
-    installRenderer(nextKind);
-    updateStatusBar();
-    statusBar()->showMessage(nextKind == RendererKind::OpenGL
-                                 ? QStringLiteral("OpenGL renderer enabled")
-                                 : QStringLiteral("Software renderer enabled"),
-                             2000);
+    const PlaybackProfile nextProfile = playbackProfile_ == PlaybackProfile::Software
+                                            ? PlaybackProfile::D3D11
+                                            : PlaybackProfile::Software;
+    activateProfile(nextProfile, true);
 }
 
 void MainWindow::onToggleFullscreen()
@@ -385,8 +366,27 @@ void MainWindow::onAbout()
         this,
         QStringLiteral("About VideoPlayer"),
         QStringLiteral("Qt / FFmpeg / SDL video player\n\n"
+                       "Profiles: Software and D3D11 zero-copy hardware decoding.\n\n"
                        "Network URL support: RTSP, RTMP/RTMPS, HLS(m3u8), "
                        "HTTP-FLV, and HTTP/HTTPS media files."));
+}
+
+void MainWindow::onD3D11FallbackRequested(const QString& reason)
+{
+    if (playbackProfile_ != PlaybackProfile::D3D11) {
+        return;
+    }
+
+    VP_WARN("D3D11 profile fallback requested reason={}", reason.toStdString());
+    const QUrl url = requestedMediaUrl_;
+    controller_->close();
+    installRenderer(PlaybackProfile::Software);
+    updateProfileActions();
+    updateStatusBar();
+    statusBar()->showMessage(QStringLiteral("D3D11 unavailable; switched to Software: %1").arg(reason), 5000);
+    if (url.isValid() && !url.isEmpty()) {
+        controller_->open(url);
+    }
 }
 
 void MainWindow::onStateChanged(PlaybackController::State)
@@ -398,10 +398,9 @@ void MainWindow::onStateChanged(PlaybackController::State)
 
 void MainWindow::onMediaLoaded()
 {
-    VP_INFO("media loaded renderer={} renderer_ptr={} hardware_decode={} has_video={} has_audio={}",
-            rendererKindName(static_cast<int>(rendererKind_)),
+    VP_INFO("media loaded profile={} renderer_ptr={} has_video={} has_audio={}",
+            playbackProfileName(playbackProfile_),
             static_cast<const void*>(renderer_),
-            hardwareDecodingEnabled_,
             controller_->hasVideo(),
             controller_->hasAudio());
     updateStatusBar();
@@ -432,69 +431,121 @@ void MainWindow::onEndOfStream()
     updateOpeningIndicator();
 }
 
-void MainWindow::installRenderer(RendererKind kind)
+void MainWindow::activateProfile(PlaybackProfile profile, bool reopenMedia)
 {
-    VP_INFO("installRenderer begin kind={} old_renderer={}",
-            rendererKindName(static_cast<int>(kind)), static_cast<const void*>(renderer_));
+    if (profile == playbackProfile_) {
+        updateProfileActions();
+        return;
+    }
+
+    const PlaybackController::State previousState = controller_->state();
+    const bool shouldReopen = reopenMedia &&
+                              requestedMediaUrl_.isValid() &&
+                              !requestedMediaUrl_.isEmpty() &&
+                              previousState != PlaybackController::State::Idle &&
+                              previousState != PlaybackController::State::Error;
+    VP_INFO("profile switch current={} requested={} reopen={}",
+            playbackProfileName(playbackProfile_), playbackProfileName(profile), shouldReopen);
+
+    controller_->close();
+    const bool installed = installRenderer(profile);
+    updateProfileActions();
+    updateStatusBar();
+    statusBar()->showMessage(installed
+                                 ? QStringLiteral("%1 profile enabled").arg(QString::fromLatin1(playbackProfileName(playbackProfile_)))
+                                 : QStringLiteral("D3D11 initialization failed; Software profile enabled"),
+                             3000);
+    if (shouldReopen) {
+        controller_->open(requestedMediaUrl_);
+    }
+}
+
+bool MainWindow::installRenderer(PlaybackProfile profile)
+{
+    VP_INFO("installRenderer begin profile={} old_renderer={}",
+            playbackProfileName(profile), static_cast<const void*>(renderer_));
     removeCurrentRenderer();
 
-    rendererKind_ = kind;
-    if (kind == RendererKind::OpenGL) {
-        renderer_ = new OpenGLRenderer(videoContainer_);
-    } else {
+    bool installedRequestedProfile = true;
+    PlaybackProfile installedProfile = profile;
+    if (profile == PlaybackProfile::D3D11) {
+        d3d11Context_ = std::make_unique<D3D11Context>();
+        if (!d3d11Context_->initialize()) {
+            VP_WARN("D3D11Context initialization failed; using Software profile");
+            d3d11Context_.reset();
+            installedRequestedProfile = false;
+            installedProfile = PlaybackProfile::Software;
+        } else {
+            auto* d3dRenderer = new D3D11Renderer(d3d11Context_.get(), videoContainer_);
+            if (d3dRenderer->isReady()) {
+                renderer_ = d3dRenderer;
+            } else {
+                VP_WARN("D3D11Renderer initialization failed; using Software profile");
+                delete d3dRenderer;
+                d3d11Context_.reset();
+                installedRequestedProfile = false;
+                installedProfile = PlaybackProfile::Software;
+            }
+        }
+    }
+
+    if (!renderer_) {
         renderer_ = new SoftwareRenderer(videoContainer_);
     }
+    playbackProfile_ = installedProfile;
 
-    QWidget* widget = renderer_ ? renderer_->asWidget() : nullptr;
-    if (widget) {
-        widget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    }
-
-    if (videoLayout_ && widget) {
+    QWidget* widget = renderer_->asWidget();
+    widget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    if (videoLayout_) {
         videoLayout_->addWidget(widget);
     }
 
     if (controller_) {
+        controller_->setPlaybackProfile(playbackProfile_, d3d11Context_.get());
         controller_->setRenderer(renderer_);
     }
 
-    VP_INFO("installRenderer done kind={} renderer={} widget={} preferred_format={} widget_size={}x{}",
-            rendererKindName(static_cast<int>(rendererKind_)),
+    VP_INFO("installRenderer done profile={} renderer={} widget={} preferred_format={}",
+            playbackProfileName(playbackProfile_),
             static_cast<const void*>(renderer_),
             static_cast<const void*>(widget),
-            renderer_ ? pixelFormatName(renderer_->preferredPixelFormat()) : "none",
-            widget ? widget->width() : -1,
-            widget ? widget->height() : -1);
-
+            pixelFormatName(renderer_->preferredPixelFormat()));
     if (rendererButton_) {
-        rendererButton_->setText(kind == RendererKind::OpenGL
-                                     ? QStringLiteral("GL")
+        rendererButton_->setText(playbackProfile_ == PlaybackProfile::D3D11
+                                     ? QStringLiteral("D3D")
                                      : QStringLiteral("SW"));
     }
+    return installedRequestedProfile;
 }
 
 void MainWindow::removeCurrentRenderer()
 {
-    if (!renderer_) {
-        return;
-    }
-
-    VP_INFO("removeCurrentRenderer kind={} renderer={}",
-            rendererKindName(static_cast<int>(rendererKind_)), static_cast<const void*>(renderer_));
-
     if (controller_) {
         controller_->setRenderer(nullptr);
     }
 
-    QWidget* widget = renderer_->asWidget();
-    if (videoLayout_ && widget) {
-        videoLayout_->removeWidget(widget);
+    if (renderer_) {
+        VP_INFO("removeCurrentRenderer profile={} renderer={}",
+                playbackProfileName(playbackProfile_), static_cast<const void*>(renderer_));
+        QWidget* widget = renderer_->asWidget();
+        if (videoLayout_ && widget) {
+            videoLayout_->removeWidget(widget);
+        }
+        delete renderer_;
+        renderer_ = nullptr;
     }
-    VP_INFO("removeCurrentRenderer deleting widget={}", static_cast<const void*>(widget));
-    delete widget;
-    renderer_ = nullptr;
+    d3d11Context_.reset();
 }
 
+void MainWindow::updateProfileActions()
+{
+    if (softwareProfileAction_) {
+        softwareProfileAction_->setChecked(playbackProfile_ == PlaybackProfile::Software);
+    }
+    if (d3d11ProfileAction_) {
+        d3d11ProfileAction_->setChecked(playbackProfile_ == PlaybackProfile::D3D11);
+    }
+}
 void MainWindow::setupControlsWidget()
 {
     controlsWidget_ = new QWidget(ui_->centralwidget);
@@ -581,7 +632,7 @@ void MainWindow::setupControlsWidget()
     speedButton_->setMenu(speedMenu_);
 
     rendererButton_ = new QPushButton(QStringLiteral("SW"), controlsWidget_);
-    rendererButton_->setFixedWidth(46);
+    rendererButton_->setFixedWidth(52);
     rendererButton_->setFocusPolicy(Qt::NoFocus);
 
     fullscreenButton_ = new QPushButton(QStringLiteral("Fullscreen"), controlsWidget_);
@@ -742,17 +793,14 @@ void MainWindow::updateOpeningIndicator()
 void MainWindow::updateStatusBar()
 {
     const QString rendererName =
-        rendererKind_ == RendererKind::Software ? QStringLiteral("SW") : QStringLiteral("OpenGL");
-    const QString hwDecodeName = hardwareDecodingEnabled_ ? QStringLiteral("HW On")
-                                                          : QStringLiteral("HW Off");
+        playbackProfile_ == PlaybackProfile::Software ? QStringLiteral("Software") : QStringLiteral("D3D11");
     const QString durationText = controller_->durationSec() < 0.0
                                      ? QStringLiteral("LIVE")
                                      : QStringLiteral("%1s").arg(controller_->durationSec(), 0, 'f', 1);
     const QString text =
-        QStringLiteral("%1 | Renderer: %2 | %3 | %4s / %5")
+        QStringLiteral("%1 | Profile: %2 | %3s / %4")
             .arg(stateText(controller_->state()))
             .arg(rendererName)
-            .arg(hwDecodeName)
             .arg(controller_->positionSec(), 0, 'f', 1)
             .arg(durationText);
     if (statusLabel_) {

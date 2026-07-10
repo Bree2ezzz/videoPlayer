@@ -17,6 +17,8 @@ extern "C" {
 #include <string>
 #include <thread>
 
+class D3D11Context;
+
 /*
  * Decoder 只负责一条已选中的媒体流：
  *   PacketQueue -> avcodec_send_packet / avcodec_receive_frame -> FrameQueue
@@ -47,7 +49,8 @@ public:
         Options()
             : threadCount(0),
               enableHardware(false),
-              hwDeviceType(AV_HWDEVICE_TYPE_NONE)
+              hwDeviceType(AV_HWDEVICE_TYPE_NONE),
+              sharedD3D11(nullptr)
         {}
 
         // 0 表示交给 FFmpeg 自己决定线程数。
@@ -56,6 +59,9 @@ public:
         // 后续任务 8.x 接硬解时使用；当前软解阶段保持 false。
         bool enableHardware;
         AVHWDeviceType hwDeviceType;
+
+        // D3D11 profile supplies the application's device; Decoder never owns it.
+        D3D11Context* sharedD3D11;
     };
 
     using EofCallback = std::function<void(int streamIndex)>;
@@ -202,6 +208,7 @@ private:
     AVBufferRef* hwDeviceCtx_ = nullptr;
     AVPixelFormat hwPixelFormat_ = AV_PIX_FMT_NONE;
     AVHWDeviceType hwDeviceType_ = AV_HWDEVICE_TYPE_NONE;
+    bool requiresD3D11Output_ = false;
 };
 
 class AudioDecoder : public Decoder

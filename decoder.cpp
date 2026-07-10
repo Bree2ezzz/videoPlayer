@@ -1,10 +1,11 @@
 #include "decoder.h"
 
 #include "app_logger.h"
-
+#include "d3d11context.h"
 
 extern "C" {
 #include <libavutil/error.h>
+#include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -63,6 +64,20 @@ std::string avErrorString(int errCode)
     char errBuf[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(errCode, errBuf, sizeof(errBuf));
     return errBuf;
+}
+
+void lockD3D11Device(void* opaque)
+{
+    if (auto* context = static_cast<D3D11Context*>(opaque)) {
+        context->lock();
+    }
+}
+
+void unlockD3D11Device(void* opaque)
+{
+    if (auto* context = static_cast<D3D11Context*>(opaque)) {
+        context->unlock();
+    }
 }
 
 } // namespace
@@ -552,6 +567,9 @@ int VideoDecoder::configureCodecContext(AVCodecContext* ctx,
         return 0;
     }
 
+    requiresD3D11Output_ = options.sharedD3D11 &&
+                           options.hwDeviceType == AV_HWDEVICE_TYPE_D3D11VA;
+
     const AVPixelFormat hwFormat = hardwarePixelFormatForDevice(options.hwDeviceType);
     if (hwFormat == AV_PIX_FMT_NONE) {
         VP_WARN("hardware decoding requested but device type {} has no mapped pixel format; falling back to software decode",
@@ -559,17 +577,40 @@ int VideoDecoder::configureCodecContext(AVCodecContext* ctx,
         return 0;
     }
 
-    ret = av_hwdevice_ctx_create(&hwDeviceCtx_, options.hwDeviceType, nullptr, nullptr, 0);
+    if (options.sharedD3D11 && options.hwDeviceType == AV_HWDEVICE_TYPE_D3D11VA) {
+        if (!options.sharedD3D11->device() || !options.sharedD3D11->immediateContext()) {
+            VP_ERROR("shared D3D11 context is incomplete");
+            return AVERROR(EINVAL);
+        }
+
+        hwDeviceCtx_ = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+        if (!hwDeviceCtx_) {
+            return AVERROR(ENOMEM);
+        }
+        auto* deviceContext = reinterpret_cast<AVHWDeviceContext*>(hwDeviceCtx_->data);
+        auto* d3d11Context = static_cast<AVD3D11VADeviceContext*>(deviceContext->hwctx);
+        d3d11Context->device = options.sharedD3D11->device();
+        d3d11Context->device->AddRef();
+        // FFmpeg obtains the device's immediate context during init. D3D11 exposes one
+        // immediate context per device, so it is the same context used by the renderer.
+        d3d11Context->lock_ctx = options.sharedD3D11;
+        d3d11Context->lock = &lockD3D11Device;
+        d3d11Context->unlock = &unlockD3D11Device;
+        ret = av_hwdevice_ctx_init(hwDeviceCtx_);
+    } else {
+        ret = av_hwdevice_ctx_create(&hwDeviceCtx_, options.hwDeviceType, nullptr, nullptr, 0);
+    }
     if (ret < 0) {
-        VP_WARN("av_hwdevice_ctx_create failed device={} ret={} msg={}; falling back to software decode",
-                static_cast<int>(options.hwDeviceType), ret, avErrorString(ret));
+        VP_WARN("hardware device creation failed device={} external={} ret={} msg={}",
+                static_cast<int>(options.hwDeviceType), options.sharedD3D11 != nullptr, ret, avErrorString(ret));
         resetHardwareContext();
-        return 0;
+        // A renderer tied to a shared D3D11 device cannot safely use a private fallback device.
+        return options.sharedD3D11 ? ret : 0;
     }
     ctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
     if (!ctx->hw_device_ctx) {
         resetHardwareContext();
-        return 0;
+        return options.sharedD3D11 ? AVERROR(ENOMEM) : 0;
     }
 
     ctx->opaque = this;
@@ -588,32 +629,16 @@ int VideoDecoder::handleDecodedFrame(AVFrame* frame, int serial)
     }
 
     const AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
-    if (!isHardwarePixelFormat(format)) {
-        return Decoder::handleDecodedFrame(frame, serial);
+    if (requiresD3D11Output_ && format != AV_PIX_FMT_D3D11) {
+        VP_WARN("D3D11 profile received a software frame format={} instead of AV_PIX_FMT_D3D11",
+                static_cast<int>(format));
+        // PlaybackController maps this D3D11-only signal to a Software-profile rebuild.
+        return AVERROR(ENOSYS);
     }
 
-    AVFrame* swFrame = av_frame_alloc();
-    if (!swFrame) {
-        return AVERROR(ENOMEM);
-    }
-
-    int ret = av_hwframe_transfer_data(swFrame, frame, 0);
-    if (ret < 0) {
-        reportError(ret, "av_hwframe_transfer_data failed: " + avErrorString(ret));
-        av_frame_free(&swFrame);
-        return ret;
-    }
-
-    ret = av_frame_copy_props(swFrame, frame);
-    if (ret < 0) {
-        reportError(ret, "av_frame_copy_props failed: " + avErrorString(ret));
-        av_frame_free(&swFrame);
-        return ret;
-    }
-
-    ret = Decoder::handleDecodedFrame(swFrame, serial);
-    av_frame_free(&swFrame);
-    return ret;
+    // FrameQueue moves the hardware-frame reference unchanged. This keeps the D3D11 texture
+    // array slice on the GPU until D3D11Renderer copies it into its shader-readable texture.
+    return Decoder::handleDecodedFrame(frame, serial);
 }
 
 void VideoDecoder::handleCodecDrained()
@@ -644,6 +669,7 @@ void VideoDecoder::resetHardwareContext()
     }
     hwPixelFormat_ = AV_PIX_FMT_NONE;
     hwDeviceType_ = AV_HWDEVICE_TYPE_NONE;
+    requiresD3D11Output_ = false;
 }
 
 AudioDecoder::AudioDecoder()
