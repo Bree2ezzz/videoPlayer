@@ -1,12 +1,14 @@
 #include "renderscheduler.h"
 
+#include "app_logger.h"
+
 #include "avsync.h"
-#include "logging.h"
 #include "videorendererbase.h"
 
 extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/error.h>
+#include <libavutil/pixdesc.h>
 }
 
 #include <algorithm>
@@ -19,6 +21,22 @@ extern "C" {
 
 namespace {
 
+const char* pixelFormatName(AVPixelFormat format)
+{
+    const char* name = av_get_pix_fmt_name(format);
+    return name ? name : "unknown";
+}
+
+const char* schedulerModeName(RenderScheduler::Mode mode)
+{
+    switch (mode) {
+    case RenderScheduler::Mode::SourceFps:
+        return "SourceFps";
+    case RenderScheduler::Mode::ClockSync:
+        return "ClockSync";
+    }
+    return "Unknown";
+}
 double quietNaN()
 {
     return std::numeric_limits<double>::quiet_NaN();
@@ -93,6 +111,9 @@ void RenderScheduler::setRenderer(VideoRendererBase* renderer)
 {
     std::lock_guard<std::mutex> lock(configMutex_);
     renderer_ = renderer;
+    VP_INFO("RenderScheduler::setRenderer renderer={} preferred_format={}",
+            static_cast<const void*>(renderer_),
+            renderer_ ? pixelFormatName(static_cast<AVPixelFormat>(renderer_->preferredPixelFormat())) : "none");
 }
 
 void RenderScheduler::setTimeBase(AVRational timeBase)
@@ -115,6 +136,7 @@ void RenderScheduler::setSync(AVSync* sync)
 
 void RenderScheduler::setMode(Mode mode)
 {
+    VP_INFO("RenderScheduler::setMode mode={}", schedulerModeName(mode));
     mode_.store(mode);
     flush();
 }
@@ -126,6 +148,14 @@ RenderScheduler::Mode RenderScheduler::mode() const
 
 int RenderScheduler::start()
 {
+    VP_INFO("RenderScheduler::start requested started={} renderer={} queue={} mode={} time_base={}/{} rate={}",
+            started_.load(),
+            static_cast<const void*>(rendererSnapshot()),
+            static_cast<const void*>(frameQueueSnapshot()),
+            schedulerModeName(mode_.load()),
+            timeBaseNum_.load(),
+            timeBaseDen_.load(),
+            playbackRate_.load());
     if (started_.load()) {
         return 0;
     }
@@ -135,6 +165,9 @@ int RenderScheduler::start()
     }
 
     if (!frameQueueSnapshot() || !rendererSnapshot()) {
+        VP_ERROR("RenderScheduler::start missing queue or renderer queue={} renderer={}",
+                 static_cast<const void*>(frameQueueSnapshot()),
+                 static_cast<const void*>(rendererSnapshot()));
         return AVERROR(EINVAL);
     }
 
@@ -215,8 +248,6 @@ void RenderScheduler::seekTo(double targetPtsSec, int serial)
     seekTargetPtsSec_.store(targetPtsSec);
     seekSerial_.store(serial);
     flushRequested_.store(true);
-    VP_LOG_DEBUG() << "video seek boundary target=" << targetPtsSec
-                   << " serial=" << serial;
 }
 
 bool RenderScheduler::isRunning() const
@@ -315,8 +346,6 @@ void RenderScheduler::scheduleLoop()
         // serial）。这些旧 frame 直接丢弃，不渲染、不等待，也不更新
         // lastPtsSec_/frameTimer_，避免污染下一帧的同步计算。
         if (pktQueue && frameSerial != pktQueue->currentSerial()) {
-            VP_LOG_DEBUG() << "drop stale video frame serial=" << frameSerial
-                           << " current=" << pktQueue->currentSerial();
             av_frame_free(&frame);
             continue;
         }
@@ -337,16 +366,11 @@ void RenderScheduler::scheduleLoop()
             timingSerial_ = frameSerial;
             lastPtsSec_ = quietNaN();
             frameTimer_ = steadySeconds();
-            VP_LOG_DEBUG() << "first frame for serial=" << frameSerial
-                           << " pts=" << pts;
         }
 
         const double seekTarget = seekTargetPtsSec_.load();
         if (frameSerial == seekSerial_.load() && seekTarget >= 0.0) {
             if (hasFramePts && pts < seekTarget) {
-                VP_LOG_DEBUG() << "drop pre-target video frame serial=" << frameSerial
-                               << " pts=" << pts
-                               << " target=" << seekTarget;
                 av_frame_free(&frame);
                 continue;
             }
@@ -357,9 +381,6 @@ void RenderScheduler::scheduleLoop()
         if (!stepping && mode_.load() == Mode::ClockSync && std::isfinite(lastPtsSec_)) {
             AVSync* sync = syncSnapshot();
             if (sync && sync->isVideoLate(pts, lastPtsSec_) && queue->size() > 0) {
-                VP_LOG_DEBUG() << "drop late video frame serial=" << frameSerial
-                               << " pts=" << pts
-                               << " master=" << sync->masterClock();
                 av_frame_free(&frame);
                 continue;
             }
@@ -373,18 +394,6 @@ void RenderScheduler::scheduleLoop()
             frameTimer_ += delay;
         }
 
-        // 节流日志：每 30 帧（约 1s）打一次同步参数，方便观察 seek 后节奏
-        static thread_local int s_logCounter = 0;
-        if ((++s_logCounter % 30) == 0) {
-            AVSync* sync = syncSnapshot();
-            const double master = sync ? sync->masterClock() : 0.0;
-            const double diff = sync ? sync->lastVideoDiff() : 0.0;
-            VP_LOG_DEBUG() << "render pts=" << pts
-                           << " lastPts=" << lastPtsSec_
-                           << " delay=" << delay
-                           << " master=" << master
-                           << " diff=" << diff;
-        }
 
         const double now = steadySeconds();
         double waitSec = stepping ? 0.0 : frameTimer_ - now;
@@ -392,14 +401,6 @@ void RenderScheduler::scheduleLoop()
         if (waitSec < -kMaxFrameDelay) {
             frameTimer_ = now;
             waitSec = 0.0;
-        }
-        if (firstScheduledFrame) {
-            AVSync* sync = syncSnapshot();
-            VP_LOG_DEBUG() << "first scheduled video frame serial=" << frameSerial
-                           << " pts=" << pts
-                           << " master=" << (sync ? sync->masterClock() : 0.0)
-                           << " delay=" << delay
-                           << " wait=" << waitSec;
         }
 
         if (waitSec > 0.0 && !interruptibleSleep(waitSec, abort_, &flushRequested_)) {
@@ -418,13 +419,26 @@ void RenderScheduler::scheduleLoop()
         // seek 可能发生在等待显示期间；此时这张帧已属于旧 epoch。
         if ((pktQueue && frameSerial != pktQueue->currentSerial()) ||
             flushRequested_.load()) {
-            VP_LOG_DEBUG() << "drop video frame after scheduling boundary serial="
-                           << frameSerial;
             av_frame_free(&frame);
             continue;
         }
 
+        VP_DEBUG("RenderScheduler dispatch frame renderer={} frame={} serial={} pts={} format={} size={}x{} mode={} preferred_format={}",
+                 static_cast<const void*>(renderer),
+                 static_cast<const void*>(frame),
+                 frameSerial,
+                 pts,
+                 pixelFormatName(static_cast<AVPixelFormat>(frame->format)),
+                 frame->width,
+                 frame->height,
+                 schedulerModeName(mode_.load()),
+                 pixelFormatName(static_cast<AVPixelFormat>(renderer->preferredPixelFormat())));
         renderer->renderFrame(frame);
+        VP_DEBUG("RenderScheduler dispatched frame renderer={} frame={} serial={} pts={}",
+                 static_cast<const void*>(renderer),
+                 static_cast<const void*>(frame),
+                 frameSerial,
+                 pts);
         lastPtsSec_ = pts;
         lastDisplayedPts_.store(pts);
         if (stepping) {

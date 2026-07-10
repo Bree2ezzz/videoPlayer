@@ -1,6 +1,5 @@
 #include "demuxer.h"
 
-#include "logging.h"
 
 #include <QByteArray>
 #include <QString>
@@ -639,9 +638,6 @@ void Demuxer::doSeekLocked(int64_t timestampUs)
 
     const int ret = av_seek_frame(
         fmtCtx_, seekStreamIndex, seekTimestamp, AVSEEK_FLAG_BACKWARD);
-    VP_LOG_INFO() << "av_seek_frame target=" << timestampUs
-                  << "us streamIndex=" << seekStreamIndex
-                  << " ret=" << ret;
     if (ret < 0) {
         if (errorCb_) {
             errorCb_(ret, "av_seek_frame failed: " + avErrorString(ret));
@@ -661,8 +657,6 @@ void Demuxer::doSeekLocked(int64_t timestampUs)
         queue->flush();
     }
     if (!queues.empty()) {
-        VP_LOG_DEBUG() << "post-seek flush, new serial="
-                       << queues.front()->currentSerial();
     }
 
     if (seekCompletedCb_) {

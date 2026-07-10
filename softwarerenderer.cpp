@@ -1,15 +1,26 @@
 #include "softwarerenderer.h"
 
+#include "app_logger.h"
+
 #include <QMetaObject>
 #include <QPainter>
 #include <QPaintEvent>
 #include <QThread>
+
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 
 #include <limits>
 #include <utility>
 
 namespace {
 
+const char* pixelFormatName(AVPixelFormat format)
+{
+    const char* name = av_get_pix_fmt_name(format);
+    return name ? name : "unknown";
+}
 void requestQueuedUpdate(QWidget* widget, std::atomic_bool& updatePending)
 {
     if (!widget) {
@@ -37,12 +48,14 @@ void requestQueuedUpdate(QWidget* widget, std::atomic_bool& updatePending)
 SoftwareRenderer::SoftwareRenderer(QWidget* parent)
     : QWidget(parent)
 {
+    VP_INFO("SoftwareRenderer created this={} parent={}", static_cast<const void*>(this), static_cast<const void*>(parent));
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAutoFillBackground(false);
 }
 
 SoftwareRenderer::~SoftwareRenderer()
 {
+    VP_INFO("SoftwareRenderer destroyed this={}", static_cast<const void*>(this));
     std::lock_guard<std::mutex> lock(convertMutex_);
     releaseSwsResources();
 }
@@ -50,25 +63,48 @@ SoftwareRenderer::~SoftwareRenderer()
 void SoftwareRenderer::renderFrame(AVFrame* frame)
 {
     if (!frame) {
+        VP_WARN("SoftwareRenderer::renderFrame ignored null frame this={}", static_cast<const void*>(this));
         return;
     }
+
+    VP_DEBUG("SoftwareRenderer::renderFrame this={} frame={} size={}x{} format={} pts={} best_effort={} gui_thread={} widget_size={}x{}",
+             static_cast<const void*>(this),
+             static_cast<const void*>(frame),
+             frame->width,
+             frame->height,
+             pixelFormatName(static_cast<AVPixelFormat>(frame->format)),
+             frame->pts,
+             frame->best_effort_timestamp,
+             QThread::currentThread() == thread(),
+             width(),
+             height());
 
     {
         std::lock_guard<std::mutex> convertLock(convertMutex_);
         QImage image = convertFrameToImage(frame);
         if (image.isNull()) {
+            VP_WARN("SoftwareRenderer::renderFrame conversion returned null image this={} frame={} format={} size={}x{}",
+                    static_cast<const void*>(this),
+                    static_cast<const void*>(frame),
+                    pixelFormatName(static_cast<AVPixelFormat>(frame->format)),
+                    frame->width,
+                    frame->height);
             return;
         }
 
+        VP_DEBUG("SoftwareRenderer converted frame this={} image={}x{} bytes_per_line={}",
+                 static_cast<const void*>(this), image.width(), image.height(), image.bytesPerLine());
         std::lock_guard<std::mutex> imageLock(imageMutex_);
         currentImage_ = std::move(image);
     }
 
     requestQueuedUpdate(this, updatePending_);
+    VP_DEBUG("SoftwareRenderer requested update this={} pending={}", static_cast<const void*>(this), updatePending_.load());
 }
 
 void SoftwareRenderer::clear()
 {
+    VP_INFO("SoftwareRenderer::clear this={}", static_cast<const void*>(this));
     {
         std::lock_guard<std::mutex> lock(imageMutex_);
         currentImage_ = QImage();
@@ -108,20 +144,40 @@ void SoftwareRenderer::paintEvent(QPaintEvent* event)
     painter.fillRect(rect(), backgroundColor);
 
     if (image.isNull()) {
+        VP_DEBUG("SoftwareRenderer::paintEvent this={} widget={}x{} image=null",
+                 static_cast<const void*>(this), width(), height());
         return;
     }
 
-    painter.drawImage(computeTargetRect(image.size()), image);
+    const QRect target = computeTargetRect(image.size());
+    VP_DEBUG("SoftwareRenderer::paintEvent this={} widget={}x{} image={}x{} target=({},{} {}x{})",
+             static_cast<const void*>(this),
+             width(),
+             height(),
+             image.width(),
+             image.height(),
+             target.x(),
+             target.y(),
+             target.width(),
+             target.height());
+    painter.drawImage(target, image);
 }
 
 QImage SoftwareRenderer::convertFrameToImage(AVFrame* frame)
 {
     if (!frame || frame->width <= 0 || frame->height <= 0) {
+        VP_WARN("SoftwareRenderer::convertFrameToImage invalid frame this={} frame={} size={}x{}",
+                static_cast<const void*>(this),
+                static_cast<const void*>(frame),
+                frame ? frame->width : -1,
+                frame ? frame->height : -1);
         return QImage();
     }
 
     const AVPixelFormat framePixFmt = static_cast<AVPixelFormat>(frame->format);
     if (framePixFmt == AV_PIX_FMT_NONE) {
+        VP_WARN("SoftwareRenderer::convertFrameToImage frame has AV_PIX_FMT_NONE this={} frame={}",
+                static_cast<const void*>(this), static_cast<const void*>(frame));
         return QImage();
     }
 
@@ -132,6 +188,14 @@ QImage SoftwareRenderer::convertFrameToImage(AVFrame* frame)
         srcPixFmt_ != framePixFmt;
 
     if (sourceChanged) {
+        VP_INFO("SoftwareRenderer rebuilding sws this={} source={}x{} format={} old={}x{} old_format={}",
+                static_cast<const void*>(this),
+                frame->width,
+                frame->height,
+                pixelFormatName(framePixFmt),
+                srcWidth_,
+                srcHeight_,
+                pixelFormatName(srcPixFmt_));
         releaseSwsResources();
 
         swsCtx_ = sws_getContext(frame->width,
@@ -145,6 +209,11 @@ QImage SoftwareRenderer::convertFrameToImage(AVFrame* frame)
                                  nullptr,
                                  nullptr);
         if (!swsCtx_) {
+            VP_ERROR("SoftwareRenderer sws_getContext failed this={} source={}x{} format={}",
+                     static_cast<const void*>(this),
+                     frame->width,
+                     frame->height,
+                     pixelFormatName(framePixFmt));
             return QImage();
         }
 
@@ -156,12 +225,16 @@ QImage SoftwareRenderer::convertFrameToImage(AVFrame* frame)
 
     QImage image(frame->width, frame->height, QImage::Format_RGBA8888);
     if (image.isNull()) {
+        VP_ERROR("SoftwareRenderer QImage allocation failed this={} size={}x{}",
+                 static_cast<const void*>(this), frame->width, frame->height);
         return QImage();
     }
 
     const auto bytesPerLine = image.bytesPerLine();
     if (bytesPerLine <= 0 ||
         bytesPerLine > std::numeric_limits<int>::max()) {
+        VP_ERROR("SoftwareRenderer invalid QImage bytesPerLine this={} bytes_per_line={}",
+                 static_cast<const void*>(this), bytesPerLine);
         return QImage();
     }
 
@@ -176,6 +249,8 @@ QImage SoftwareRenderer::convertFrameToImage(AVFrame* frame)
                                        dstData,
                                        dstLineSizes);
     if (scaledHeight != frame->height) {
+        VP_ERROR("SoftwareRenderer sws_scale returned unexpected height this={} converted={} expected={}",
+                 static_cast<const void*>(this), scaledHeight, frame->height);
         return QImage();
     }
 
@@ -198,6 +273,8 @@ QRect SoftwareRenderer::computeTargetRect(const QSize& imageSize) const
 void SoftwareRenderer::releaseSwsResources()
 {
     if (swsCtx_) {
+        VP_DEBUG("SoftwareRenderer releasing sws this={} source={}x{} format={}",
+                 static_cast<const void*>(this), srcWidth_, srcHeight_, pixelFormatName(srcPixFmt_));
         sws_freeContext(swsCtx_);
         swsCtx_ = nullptr;
     }

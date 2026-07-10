@@ -1,18 +1,21 @@
 #include "playbackcontroller.h"
 
+#include "app_logger.h"
+
 #include "PacketQueue.h"
 #include "FrameQueue.h"
 #include "audiooutput.h"
 #include "avsync.h"
 #include "decoder.h"
 #include "demuxer.h"
-#include "logging.h"
 #include "networkoptions.h"
 #include "renderscheduler.h"
 
 extern "C" {
 #include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
+#include <libavutil/samplefmt.h>
 #include <libavformat/avformat.h>
 }
 
@@ -23,6 +26,7 @@ extern "C" {
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -37,6 +41,56 @@ QString avErrorString(int errCode)
     char errBuf[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(errCode, errBuf, sizeof(errBuf));
     return QString::fromLocal8Bit(errBuf);
+}
+
+std::string qStringForLog(const QString& value)
+{
+    return value.toStdString();
+}
+
+std::string urlForLog(const QUrl& url)
+{
+    return url.toString(QUrl::FullyEncoded).toStdString();
+}
+
+const char* stateName(PlaybackController::State state)
+{
+    switch (state) {
+    case PlaybackController::State::Idle:
+        return "Idle";
+    case PlaybackController::State::Opening:
+        return "Opening";
+    case PlaybackController::State::Ready:
+        return "Ready";
+    case PlaybackController::State::Playing:
+        return "Playing";
+    case PlaybackController::State::Paused:
+        return "Paused";
+    case PlaybackController::State::Seeking:
+        return "Seeking";
+    case PlaybackController::State::Stopped:
+        return "Stopped";
+    case PlaybackController::State::Error:
+        return "Error";
+    }
+    return "Unknown";
+}
+
+const char* sampleFormatName(AVSampleFormat format)
+{
+    const char* name = av_get_sample_fmt_name(format);
+    return name ? name : "unknown";
+}
+
+std::string channelLayoutString(const AVChannelLayout& layout)
+{
+    char desc[128] = {};
+    if (layout.nb_channels > 0 &&
+        av_channel_layout_describe(&layout, desc, sizeof(desc)) >= 0 &&
+        desc[0] != '\0') {
+        return desc;
+    }
+    return layout.nb_channels > 0 ? std::to_string(layout.nb_channels) + "c" : std::string("unknown");
 }
 
 QString moduleErrorMessage(const QString& module, const QString& msg)
@@ -183,6 +237,10 @@ PlaybackController::~PlaybackController()
 void PlaybackController::setRenderer(VideoRendererBase* renderer)
 {
     renderer_ = renderer;
+    VP_INFO("PlaybackController::setRenderer renderer={} preferred_format={} scheduler={}",
+            static_cast<const void*>(renderer_),
+            renderer_ ? renderer_->preferredPixelFormat() : -1,
+            static_cast<const void*>(renderScheduler_.get()));
     if (renderScheduler_) {
         renderScheduler_->setRenderer(renderer_);
     }
@@ -205,11 +263,13 @@ void PlaybackController::open(const QUrl& url)
     currentUrl_ = url;
 
     const unsigned long long serial = openSerial_.load();
+    VP_INFO("open requested serial={} url={}", serial, urlForLog(url));
     startOpenWorker(url, serial, false);
 }
 
 void PlaybackController::close()
 {
+    VP_INFO("close requested state={} url={}", stateName(state()), urlForLog(currentUrl_));
     ++openSerial_;
     cancelOpenWorker();
     joinOpenWorker();
@@ -241,8 +301,11 @@ void PlaybackController::close()
 void PlaybackController::play()
 {
     State s = state();
+    VP_INFO("play requested state={} has_audio={} has_video={} realtime={} rate={}",
+            stateName(s), hasAudio_, hasVideo_, realtime_, playbackRate_.load());
     if (s == State::Playing || s == State::Opening || s == State::Seeking ||
         s == State::Idle || s == State::Stopped || s == State::Error) {
+        VP_WARN("play ignored in state={}", stateName(s));
         return;
     }
 
@@ -257,40 +320,50 @@ void PlaybackController::play()
 
     if (s == State::Ready) {
         if (renderScheduler_) {
+            VP_INFO("starting RenderScheduler");
             const int ret = renderScheduler_->start();
             if (ret < 0) {
+                VP_ERROR("RenderScheduler start failed ret={} msg={}", ret, qStringForLog(avErrorString(ret)));
                 enterError(ret, QStringLiteral("RenderScheduler start failed: ") + avErrorString(ret));
                 return;
             }
         }
 
         if (audioOutput_) {
+            VP_INFO("starting AudioOutput");
             const int ret = audioOutput_->start();
             if (ret < 0) {
+                VP_ERROR("AudioOutput start failed ret={} msg={}", ret, qStringForLog(avErrorString(ret)));
                 enterError(ret, QStringLiteral("AudioOutput start failed: ") + avErrorString(ret));
                 return;
             }
         }
 
         if (videoDecoder_) {
+            VP_INFO("starting VideoDecoder");
             const int ret = videoDecoder_->start();
             if (ret < 0) {
+                VP_ERROR("VideoDecoder start failed ret={} msg={}", ret, qStringForLog(avErrorString(ret)));
                 enterError(ret, QStringLiteral("VideoDecoder start failed: ") + avErrorString(ret));
                 return;
             }
         }
 
         if (audioDecoder_) {
+            VP_INFO("starting AudioDecoder");
             const int ret = audioDecoder_->start();
             if (ret < 0) {
+                VP_ERROR("AudioDecoder start failed ret={} msg={}", ret, qStringForLog(avErrorString(ret)));
                 enterError(ret, QStringLiteral("AudioDecoder start failed: ") + avErrorString(ret));
                 return;
             }
         }
 
         if (demuxer_) {
+            VP_INFO("starting Demuxer");
             const int ret = demuxer_->start();
             if (ret < 0) {
+                VP_ERROR("Demuxer start failed ret={} msg={}", ret, qStringForLog(avErrorString(ret)));
                 enterError(ret, QStringLiteral("Demuxer start failed: ") + avErrorString(ret));
                 return;
             }
@@ -308,6 +381,7 @@ void PlaybackController::play()
 
     positionTimer_->start();
     transitionTo(State::Playing);
+    VP_INFO("playback started state={}", stateName(state()));
 }
 
 void PlaybackController::pause()
@@ -430,6 +504,7 @@ void PlaybackController::setPlaybackRate(float rate)
     applyPlaybackRateToOutputs();
 
     if (std::fabs(old - clamped) >= 0.0001f) {
+        VP_INFO("playback rate changed old={} new={}", old, clamped);
         emit playbackRateChanged(clamped);
     }
 }
@@ -570,6 +645,7 @@ void PlaybackController::handleAudioEofFromModule()
 
 void PlaybackController::handleErrorFromModule(int errCode, const QString& msg)
 {
+    VP_ERROR("module error code={} msg={}", errCode, qStringForLog(msg));
     if (scheduleReconnect(errCode, msg)) {
         return;
     }
@@ -580,12 +656,14 @@ void PlaybackController::transitionTo(State newState)
 {
     const State old = state_.exchange(newState);
     if (old != newState) {
+        VP_DEBUG("state changed {} -> {}", stateName(old), stateName(newState));
         emit stateChanged(newState);
     }
 }
 
 void PlaybackController::enterError(int errCode, const QString& msg)
 {
+    VP_ERROR("enterError requested code={} msg={} state={}", errCode, qStringForLog(msg), stateName(state()));
     if (scheduleReconnect(errCode, msg)) {
         return;
     }
@@ -623,6 +701,7 @@ bool PlaybackController::buildPipeline(const QUrl& url)
 
 bool PlaybackController::finishPipelineAfterDemuxerOpen()
 {
+    VP_INFO("finishPipelineAfterDemuxerOpen begin");
     if (!demuxer_) {
         enterError(AVERROR(EINVAL), QStringLiteral("Demuxer is not open"));
         return false;
@@ -633,6 +712,8 @@ bool PlaybackController::finishPipelineAfterDemuxerOpen()
     }
 
     readDemuxerInfo();
+    VP_INFO("demuxer info video_stream={} audio_stream={} duration_sec={} realtime={}",
+            videoStreamIndex_, audioStreamIndex_, durationSec_, realtime_);
 
     if (!openDecoders() ||
         !openAudioOutput() ||
@@ -645,6 +726,8 @@ bool PlaybackController::finishPipelineAfterDemuxerOpen()
     installModuleCallbacks();
     applyVolumeToOutput();
     applyPlaybackRateToOutputs();
+    VP_INFO("pipeline ready has_audio={} has_video={} audio_stream={} video_stream={}",
+            hasAudio_, hasVideo_, audioStreamIndex_, videoStreamIndex_);
     return true;
 }
 
@@ -701,6 +784,7 @@ void PlaybackController::startOpenWorker(const QUrl& url,
                                          bool autoPlay)
 {
     joinOpenWorker();
+    VP_INFO("start open worker serial={} auto_play={} url={}", serial, autoPlay, urlForLog(url));
 
     auto job = std::make_shared<OpenJob>();
     openJob_ = job;
@@ -712,6 +796,7 @@ void PlaybackController::startOpenWorker(const QUrl& url,
             result->url = url;
             result->autoPlay = autoPlay;
             result->demuxer = std::make_unique<Demuxer>();
+            VP_INFO("open worker running serial={} auto_play={} url={}", serial, autoPlay, urlForLog(url));
 
             if (job->isCancelled()) {
                 return;
@@ -723,7 +808,9 @@ void PlaybackController::startOpenWorker(const QUrl& url,
                 return;
             }
 
+            VP_INFO("Demuxer open begin serial={} url={}", serial, urlForLog(url));
             const int ret = result->demuxer->open(url, networkOptionsForUrl(url));
+            VP_INFO("Demuxer open finished serial={} ret={} msg={}", serial, ret, ret < 0 ? qStringForLog(avErrorString(ret)) : std::string("ok"));
             job->setActiveDemuxer(nullptr);
 
             if (job->isCancelled()) {
@@ -753,8 +840,13 @@ void PlaybackController::handleOpenWorkerResult(
     if (!result ||
         openSerial_.load() != serial ||
         state() != State::Opening) {
+        VP_DEBUG("open worker result ignored serial={} current_serial={} state={} has_result={}",
+                 serial, openSerial_.load(), stateName(state()), result != nullptr);
         return;
     }
+
+    VP_INFO("open worker result serial={} err={} auto_play={} url={}",
+            serial, result->errCode, result->autoPlay, urlForLog(result->url));
 
     joinOpenWorker();
     openJob_.reset();
@@ -813,13 +905,17 @@ void PlaybackController::joinOpenWorker()
 
 bool PlaybackController::openDemuxer(const QUrl& url)
 {
+    VP_INFO("openDemuxer begin url={}", urlForLog(url));
     const int ret = demuxer_->open(url, networkOptionsForUrl(url));
+    VP_INFO("openDemuxer finished ret={} msg={}", ret, ret < 0 ? qStringForLog(avErrorString(ret)) : std::string("ok"));
     if (ret < 0) {
         enterError(ret, QStringLiteral("Demuxer open failed: ") + avErrorString(ret));
         return false;
     }
 
     readDemuxerInfo();
+    VP_INFO("demuxer info video_stream={} audio_stream={} duration_sec={} realtime={}",
+            videoStreamIndex_, audioStreamIndex_, durationSec_, realtime_);
     return true;
 }
 
@@ -836,18 +932,24 @@ bool PlaybackController::openDecoders()
         videoFrameQueue_ = std::make_unique<FrameQueue>();
         videoDecoder_ = std::make_unique<VideoDecoder>();
 
+        VP_INFO("opening video decoder stream={} codec_id={}",
+                videoStreamIndex_, stream->codecpar ? static_cast<int>(stream->codecpar->codec_id) : -1);
+
         Decoder::Options videoOptions;
         videoOptions.enableHardware = hardwareDecodingEnabled_.load();
         videoOptions.hwDeviceType = videoOptions.enableHardware
                                         ? defaultHardwareDeviceType()
                                         : AV_HWDEVICE_TYPE_NONE;
 
+        VP_INFO("video decoder options stream={} hw_enabled={} hw_device={}",
+                videoStreamIndex_, videoOptions.enableHardware, static_cast<int>(videoOptions.hwDeviceType));
         int ret = videoDecoder_->open(stream, videoOptions);
         if (ret < 0) {
             enterError(ret, QStringLiteral("VideoDecoder open failed: ") + avErrorString(ret));
             return false;
         }
 
+        VP_INFO("video decoder opened stream={}", videoStreamIndex_);
         videoDecoder_->setQueues(videoPacketQueue_.get(), videoFrameQueue_.get());
         demuxer_->setPacketQueue(videoStreamIndex_, videoPacketQueue_.get());
         hasVideo_ = true;
@@ -862,6 +964,16 @@ bool PlaybackController::openDecoders()
             return false;
         }
 
+        if (stream->codecpar) {
+            VP_INFO("opening audio decoder stream={} codec_id={} sample_rate={} sample_fmt={} channels={} channel_layout={}",
+                    audioStreamIndex_,
+                    static_cast<int>(stream->codecpar->codec_id),
+                    stream->codecpar->sample_rate,
+                    sampleFormatName(static_cast<AVSampleFormat>(stream->codecpar->format)),
+                    stream->codecpar->ch_layout.nb_channels,
+                    channelLayoutString(stream->codecpar->ch_layout));
+        }
+
         audioPacketQueue_ = std::make_unique<PacketQueue>();
         audioFrameQueue_ = std::make_unique<FrameQueue>();
         audioDecoder_ = std::make_unique<AudioDecoder>();
@@ -872,6 +984,7 @@ bool PlaybackController::openDecoders()
             return false;
         }
 
+        VP_INFO("audio decoder opened stream={}", audioStreamIndex_);
         audioDecoder_->setQueues(audioPacketQueue_.get(), audioFrameQueue_.get());
         demuxer_->setPacketQueue(audioStreamIndex_, audioPacketQueue_.get());
         hasAudio_ = true;
@@ -899,6 +1012,19 @@ bool PlaybackController::openAudioOutput()
         return false;
     }
 
+    if (stream->codecpar) {
+        VP_INFO("opening AudioOutput stream={} codec_id={} sample_rate={} sample_fmt={} channels={} channel_layout={} time_base={}/{} rate={}",
+                audioStreamIndex_,
+                static_cast<int>(stream->codecpar->codec_id),
+                stream->codecpar->sample_rate,
+                sampleFormatName(static_cast<AVSampleFormat>(stream->codecpar->format)),
+                stream->codecpar->ch_layout.nb_channels,
+                channelLayoutString(stream->codecpar->ch_layout),
+                stream->time_base.num,
+                stream->time_base.den,
+                playbackRate_.load());
+    }
+
     audioOutput_ = std::make_unique<AudioOutput>();
     audioOutput_->setFrameQueue(audioFrameQueue_.get());
     // 把 packet queue 同时传给 audio output，供其在 pop frame 时通过
@@ -910,6 +1036,13 @@ bool PlaybackController::openAudioOutput()
         enterError(ret, QStringLiteral("AudioOutput open failed: ") + avErrorString(ret));
         return false;
     }
+
+
+    VP_INFO("AudioOutput opened stream={} actual_rate={} actual_channels={} rate={}",
+            audioStreamIndex_,
+            audioOutput_->actualParams().sampleRate,
+            audioOutput_->actualParams().channels,
+            playbackRate_.load());
 
     avSync_->setAudioClockSource(
         [this] {
@@ -944,6 +1077,8 @@ bool PlaybackController::wireScheduler()
     renderScheduler_->setSync(avSync_.get());
     renderScheduler_->setMode(hasAudio_ ? RenderScheduler::Mode::ClockSync
                                         : RenderScheduler::Mode::SourceFps);
+    VP_INFO("RenderScheduler wired video_stream={} mode={} frame_interval_sec={}",
+            videoStreamIndex_, hasAudio_ ? "ClockSync" : "SourceFps", videoFrameIntervalSec_);
     return true;
 }
 
@@ -958,9 +1093,6 @@ void PlaybackController::doSeek(double positionSec)
 
     const double targetSec = clampSeekPosition(positionSec, durationSec_);
     const int64_t targetUs = static_cast<int64_t>(targetSec * AV_TIME_BASE);
-
-    VP_LOG_INFO() << "doSeek targetSec=" << targetSec
-                  << " currentState=" << static_cast<int>(currentState);
 
     lastSeekTargetSec_.store(targetSec);
     if (currentState != State::Ready) {

@@ -2,3 +2,5 @@ build/
 .codex/
 .agents/
 CMakeLists.txt.user
+build-mingw/
+任务书*.md

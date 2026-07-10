@@ -1,8 +1,7 @@
 #include "mainwindow.h"
-#include "logging.h"
+#include "app_logger.h"
 
 #include <QApplication>
-#include <QLoggingCategory>
 #include <QString>
 #include <QUrl>
 extern "C" {
@@ -20,17 +19,8 @@ int main(int argc, char *argv[])
     }
     avformat_network_init();
 
-    // 日志格式：[级别] 文件:行 函数 - 内容
-    qSetMessagePattern(
-        "[%{type}] %{file}:%{line} %{function} - %{message}");
-
-    // 日志级别开关。开发期开 debug，发布期改成 *.debug=false 即可。
-    // 也可以通过环境变量 QT_LOGGING_RULES 覆盖，方便不重编切换。
-    QLoggingCategory::setFilterRules(QStringLiteral(
-        "videoplayer.debug=true\n"
-        "videoplayer.info=true\n"
-        "videoplayer.warning=true\n"
-        "videoplayer.critical=true\n"));
+    AppLogger::initialize();
+    VP_INFO("application startup argc={}", argc);
 
     QApplication a(argc, argv);
     MainWindow w;
@@ -45,5 +35,7 @@ int main(int argc, char *argv[])
     avformat_network_deinit();
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     SDL_Quit();
+    VP_INFO("application shutdown ret={}", ret);
+    AppLogger::shutdown();
     return ret;
 }

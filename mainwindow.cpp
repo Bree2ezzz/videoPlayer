@@ -1,4 +1,6 @@
 #include "mainwindow.h"
+
+#include "app_logger.h"
 #include "./ui_mainwindow.h"
 
 #include "softwarerenderer.h"
@@ -26,14 +28,40 @@
 #include <QStatusBar>
 #include <QVBoxLayout>
 
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
 
 namespace {
 
 constexpr int kProgressSliderScale = 1000;
 
+const char* rendererKindName(int kind)
+{
+    switch (kind) {
+    case 0:
+        return "Software";
+    case 1:
+        return "OpenGL";
+    }
+    return "Unknown";
+}
+
+const char* pixelFormatName(int format)
+{
+    const char* name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(format));
+    return name ? name : "unknown";
+}
+
+std::string urlForLog(const QUrl& url)
+{
+    return url.toString(QUrl::FullyEncoded).toStdString();
+}
 int progressSliderMax(double durationSec)
 {
     if (!std::isfinite(durationSec) || durationSec <= 0.0) {
@@ -138,7 +166,11 @@ MainWindow::MainWindow(QWidget* parent)
     connect(fullscreenAction, &QAction::triggered, this, &MainWindow::onToggleFullscreen);
     connect(switchRendererAction, &QAction::triggered, this, &MainWindow::onSwitchRenderer);
     connect(hardwareDecodeAction, &QAction::toggled, this, [this, hardwareDecodeAction](bool enabled) {
+        VP_INFO("hardware decoding toggle requested enabled={} current={} renderer={} is_open={}",
+                enabled, hardwareDecodingEnabled_, rendererKindName(static_cast<int>(rendererKind_)), controller_->isOpen());
         if (controller_->isOpen()) {
+            VP_WARN("hardware decoding toggle blocked because media is open renderer={} requested={}",
+                    rendererKindName(static_cast<int>(rendererKind_)), enabled);
             statusBar()->showMessage(QStringLiteral("Close the current media before changing hardware decoding"), 3000);
             QSignalBlocker blocker(hardwareDecodeAction);
             hardwareDecodeAction->setChecked(hardwareDecodingEnabled_);
@@ -146,6 +178,7 @@ MainWindow::MainWindow(QWidget* parent)
         }
 
         hardwareDecodingEnabled_ = enabled;
+        VP_INFO("hardware decoding changed enabled={} renderer={}", enabled, rendererKindName(static_cast<int>(rendererKind_)));
         controller_->setHardwareDecodingEnabled(enabled);
         updateStatusBar();
         statusBar()->showMessage(enabled
@@ -194,7 +227,13 @@ MainWindow::~MainWindow()
 
 void MainWindow::openMedia(const QUrl& url)
 {
+    VP_INFO("MainWindow::openMedia url={} renderer={} renderer_ptr={} hardware_decode={}",
+            urlForLog(url),
+            rendererKindName(static_cast<int>(rendererKind_)),
+            static_cast<const void*>(renderer_),
+            hardwareDecodingEnabled_);
     if (!url.isValid() || url.isEmpty()) {
+        VP_WARN("MainWindow::openMedia ignored invalid url={}", urlForLog(url));
         return;
     }
 
@@ -309,7 +348,12 @@ void MainWindow::onOpenUrl()
 
 void MainWindow::onSwitchRenderer()
 {
+    VP_INFO("renderer switch requested current={} renderer_ptr={} is_open={}",
+            rendererKindName(static_cast<int>(rendererKind_)),
+            static_cast<const void*>(renderer_),
+            controller_->isOpen());
     if (controller_->isOpen()) {
+        VP_WARN("renderer switch blocked because media is open current={}", rendererKindName(static_cast<int>(rendererKind_)));
         statusBar()->showMessage(QStringLiteral("Close the current media before switching renderer"), 3000);
         return;
     }
@@ -317,6 +361,7 @@ void MainWindow::onSwitchRenderer()
     const RendererKind nextKind = rendererKind_ == RendererKind::Software
                                       ? RendererKind::OpenGL
                                       : RendererKind::Software;
+    VP_INFO("renderer switch installing next={}", rendererKindName(static_cast<int>(nextKind)));
     installRenderer(nextKind);
     updateStatusBar();
     statusBar()->showMessage(nextKind == RendererKind::OpenGL
@@ -353,6 +398,12 @@ void MainWindow::onStateChanged(PlaybackController::State)
 
 void MainWindow::onMediaLoaded()
 {
+    VP_INFO("media loaded renderer={} renderer_ptr={} hardware_decode={} has_video={} has_audio={}",
+            rendererKindName(static_cast<int>(rendererKind_)),
+            static_cast<const void*>(renderer_),
+            hardwareDecodingEnabled_,
+            controller_->hasVideo(),
+            controller_->hasAudio());
     updateStatusBar();
     updatePositionControls(controller_->positionSec(), controller_->durationSec());
     updateVolumeControls(controller_->volume(), controller_->isMuted());
@@ -383,6 +434,8 @@ void MainWindow::onEndOfStream()
 
 void MainWindow::installRenderer(RendererKind kind)
 {
+    VP_INFO("installRenderer begin kind={} old_renderer={}",
+            rendererKindName(static_cast<int>(kind)), static_cast<const void*>(renderer_));
     removeCurrentRenderer();
 
     rendererKind_ = kind;
@@ -405,6 +458,14 @@ void MainWindow::installRenderer(RendererKind kind)
         controller_->setRenderer(renderer_);
     }
 
+    VP_INFO("installRenderer done kind={} renderer={} widget={} preferred_format={} widget_size={}x{}",
+            rendererKindName(static_cast<int>(rendererKind_)),
+            static_cast<const void*>(renderer_),
+            static_cast<const void*>(widget),
+            renderer_ ? pixelFormatName(renderer_->preferredPixelFormat()) : "none",
+            widget ? widget->width() : -1,
+            widget ? widget->height() : -1);
+
     if (rendererButton_) {
         rendererButton_->setText(kind == RendererKind::OpenGL
                                      ? QStringLiteral("GL")
@@ -418,6 +479,9 @@ void MainWindow::removeCurrentRenderer()
         return;
     }
 
+    VP_INFO("removeCurrentRenderer kind={} renderer={}",
+            rendererKindName(static_cast<int>(rendererKind_)), static_cast<const void*>(renderer_));
+
     if (controller_) {
         controller_->setRenderer(nullptr);
     }
@@ -426,6 +490,7 @@ void MainWindow::removeCurrentRenderer()
     if (videoLayout_ && widget) {
         videoLayout_->removeWidget(widget);
     }
+    VP_INFO("removeCurrentRenderer deleting widget={}", static_cast<const void*>(widget));
     delete widget;
     renderer_ = nullptr;
 }

@@ -1,6 +1,7 @@
 #include "decoder.h"
 
-#include "logging.h"
+#include "app_logger.h"
+
 
 extern "C" {
 #include <libavutil/error.h>
@@ -337,6 +338,7 @@ int Decoder::pushFrameToOutput(AVFrame* frame, int serial)
 
 void Decoder::reportError(int errCode, const std::string& msg)
 {
+    VP_ERROR("Decoder error stream={} code={} msg={}", streamIndex_, errCode, msg);
     if (errorCb_) {
         errorCb_(errCode, msg);
     }
@@ -459,10 +461,6 @@ void Decoder::decodeLoop()
         // 这种"内嵌在 packet 流里的 flush 信号"取代了原先的 flushPending_ 标志，
         // 时机精确卡在新旧 GOP 边界，不再有 mmco / Missing reference 错误。
         if (pktSerial != pktSerial_) {
-            VP_LOG_DEBUG() << "serial changed " << pktSerial_
-                           << " -> " << pktSerial
-                           << " streamIndex=" << streamIndex_
-                           << " pkt.pts=" << pkt->pts;
             std::lock_guard<std::mutex> lock(codecMutex_);
             if (codecCtx_) {
                 avcodec_flush_buffers(codecCtx_);
@@ -556,22 +554,18 @@ int VideoDecoder::configureCodecContext(AVCodecContext* ctx,
 
     const AVPixelFormat hwFormat = hardwarePixelFormatForDevice(options.hwDeviceType);
     if (hwFormat == AV_PIX_FMT_NONE) {
-        VP_LOG_WARN() << "unsupported hardware device type="
-                      << av_hwdevice_get_type_name(options.hwDeviceType)
-                      << "; falling back to software decode";
+        VP_WARN("hardware decoding requested but device type {} has no mapped pixel format; falling back to software decode",
+                static_cast<int>(options.hwDeviceType));
         return 0;
     }
 
     ret = av_hwdevice_ctx_create(&hwDeviceCtx_, options.hwDeviceType, nullptr, nullptr, 0);
     if (ret < 0) {
-        VP_LOG_WARN() << "av_hwdevice_ctx_create failed for "
-                      << av_hwdevice_get_type_name(options.hwDeviceType)
-                      << ": " << avErrorString(ret)
-                      << "; falling back to software decode";
+        VP_WARN("av_hwdevice_ctx_create failed device={} ret={} msg={}; falling back to software decode",
+                static_cast<int>(options.hwDeviceType), ret, avErrorString(ret));
         resetHardwareContext();
         return 0;
     }
-
     ctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
     if (!ctx->hw_device_ctx) {
         resetHardwareContext();
@@ -582,9 +576,8 @@ int VideoDecoder::configureCodecContext(AVCodecContext* ctx,
     ctx->get_format = &VideoDecoder::getHardwareFormat;
     hwPixelFormat_ = hwFormat;
     hwDeviceType_ = options.hwDeviceType;
-    VP_LOG_INFO() << "hardware decode enabled device="
-                  << av_hwdevice_get_type_name(hwDeviceType_)
-                  << " pixfmt=" << av_get_pix_fmt_name(hwPixelFormat_);
+    VP_INFO("hardware decoding configured stream={} device={} pixel_format={}",
+            streamIndex(), static_cast<int>(hwDeviceType_), static_cast<int>(hwPixelFormat_));
     return 0;
 }
 
@@ -637,10 +630,8 @@ AVPixelFormat VideoDecoder::getHardwareFormat(AVCodecContext* ctx, const AVPixel
                 return *p;
             }
         }
-
-        VP_LOG_WARN() << "decoder did not offer requested hardware pixfmt="
-                      << av_get_pix_fmt_name(decoder->hwPixelFormat_)
-                      << "; falling back to software format";
+        VP_WARN("requested hardware pixel format {} was not offered by decoder; falling back to software format",
+                static_cast<int>(decoder->hwPixelFormat_));
     }
 
     return firstSoftwarePixelFormat(formats);

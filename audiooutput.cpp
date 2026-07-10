@@ -1,6 +1,7 @@
 #include "audiooutput.h"
 
-#include "logging.h"
+#include "app_logger.h"
+
 
 extern "C" {
 #include <libavfilter/buffersink.h>
@@ -17,6 +18,7 @@ extern "C" {
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <utility>
 
 namespace {
@@ -39,6 +41,34 @@ int sdlErrorCode()
     return AVERROR_EXTERNAL;
 }
 
+const char* sampleFormatName(AVSampleFormat format)
+{
+    const char* name = av_get_sample_fmt_name(format);
+    return name ? name : "unknown";
+}
+
+std::string channelLayoutString(const AVChannelLayout& layout, int fallbackChannels = 0)
+{
+    AVChannelLayout tmp{};
+    const AVChannelLayout* usedLayout = &layout;
+    if (layout.nb_channels <= 0 && fallbackChannels > 0) {
+        av_channel_layout_default(&tmp, fallbackChannels);
+        usedLayout = &tmp;
+    }
+
+    char desc[128] = {};
+    if (usedLayout->nb_channels > 0 &&
+        av_channel_layout_describe(usedLayout, desc, sizeof(desc)) >= 0 &&
+        desc[0] != '\0') {
+        av_channel_layout_uninit(&tmp);
+        return desc;
+    }
+
+    const int channels = usedLayout->nb_channels > 0 ? usedLayout->nb_channels : fallbackChannels;
+    av_channel_layout_uninit(&tmp);
+    return channels > 0 ? std::to_string(channels) + "c" : std::string("unknown");
+}
+
 } // namespace
 
 AudioOutput::AudioOutput() = default;
@@ -54,24 +84,47 @@ int AudioOutput::open(const AVCodecParameters* sourceCodecpar,
 {
 
     if (!sourceCodecpar || sourceCodecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+        VP_ERROR("AudioOutput::open rejected invalid source codec parameters ptr={} type={}",
+                 static_cast<const void*>(sourceCodecpar),
+                 sourceCodecpar ? static_cast<int>(sourceCodecpar->codec_type) : -1);
         return AVERROR(EINVAL);
     }
+
+    VP_INFO("AudioOutput::open source codec_id={} sample_rate={} sample_fmt={} channels={} channel_layout={} target_sample_rate={} target_channels={} target_samples={} target_sample_fmt={}",
+            static_cast<int>(sourceCodecpar->codec_id),
+            sourceCodecpar->sample_rate,
+            sampleFormatName(static_cast<AVSampleFormat>(sourceCodecpar->format)),
+            sourceCodecpar->ch_layout.nb_channels,
+            channelLayoutString(sourceCodecpar->ch_layout),
+            targetParams.sampleRate,
+            targetParams.channels,
+            targetParams.samplesPerCallback,
+            sampleFormatName(targetParams.sampleFormat));
 
     if (targetParams.sampleRate <= 0 ||
         targetParams.channels <= 0 ||
         targetParams.channels > std::numeric_limits<Uint8>::max() ||
         targetParams.samplesPerCallback <= 0 ||
         targetParams.samplesPerCallback > std::numeric_limits<Uint16>::max()) {
+        VP_ERROR("AudioOutput::open rejected invalid target params sample_rate={} channels={} samples={}",
+                 targetParams.sampleRate, targetParams.channels, targetParams.samplesPerCallback);
         return AVERROR(EINVAL);
     }
 
     if (targetParams.sampleFormat != AV_SAMPLE_FMT_S16) {
+        VP_ERROR("AudioOutput::open rejected unsupported target sample format {}",
+                 sampleFormatName(targetParams.sampleFormat));
         return AVERROR(EINVAL);
     }
 
     if (sourceCodecpar->sample_rate <= 0 ||
         sourceCodecpar->format == AV_SAMPLE_FMT_NONE ||
         sourceCodecpar->ch_layout.nb_channels <= 0) {
+        VP_ERROR("AudioOutput::open rejected incomplete source params sample_rate={} sample_fmt={} channels={} layout={}",
+                 sourceCodecpar->sample_rate,
+                 sampleFormatName(static_cast<AVSampleFormat>(sourceCodecpar->format)),
+                 sourceCodecpar->ch_layout.nb_channels,
+                 channelLayoutString(sourceCodecpar->ch_layout));
         return AVERROR(EINVAL);
     }
 
@@ -122,6 +175,16 @@ int AudioOutput::open(const AVCodecParameters* sourceCodecpar,
     bytesPerSample_ = av_get_bytes_per_sample(actualParams_.sampleFormat);
     bytesPerSecond_ = actualParams_.sampleRate * actualParams_.channels * bytesPerSample_;
     callbackBufferBytes_ = static_cast<int>(obtained.size);
+
+    VP_INFO("AudioOutput SDL device opened id={} requested freq={} channels={} samples={} obtained freq={} channels={} samples={} size={}",
+            static_cast<unsigned int>(device_),
+            desired.freq,
+            static_cast<int>(desired.channels),
+            static_cast<int>(desired.samples),
+            obtained.freq,
+            static_cast<int>(obtained.channels),
+            static_cast<int>(obtained.samples),
+            static_cast<int>(obtained.size));
 
     if (bytesPerSample_ <= 0 || bytesPerSecond_ <= 0) {
         const int err = AVERROR(EINVAL);
@@ -204,9 +267,19 @@ void AudioOutput::setPacketQueue(PacketQueue* queue)
 
 int AudioOutput::start()
 {
-    if (!opened_.load() || !device_ || !frameQueueSnapshot()) {
+    FrameQueue* queue = frameQueueSnapshot();
+    if (!opened_.load() || !device_ || !queue) {
+        VP_ERROR("AudioOutput::start rejected opened={} device={} frame_queue={}",
+                 opened_.load(), static_cast<unsigned int>(device_), static_cast<const void*>(queue));
         return AVERROR(EINVAL);
     }
+
+    VP_INFO("AudioOutput::start device={} sample_rate={} channels={} callback_bytes={} playback_rate={}",
+            static_cast<unsigned int>(device_),
+            actualParams_.sampleRate,
+            actualParams_.channels,
+            callbackBufferBytes_,
+            playbackRate_.load());
 
     eofReported_ = false;
     running_ = true;
@@ -290,10 +363,6 @@ void AudioOutput::seekTo(double targetPtsSec, int serial)
     if (device_) {
         SDL_ClearQueuedAudio(device_);
     }
-
-    VP_LOG_DEBUG() << "audio seek boundary target=" << targetPtsSec
-                   << " serial=" << serial
-                   << " prevAudioClock=" << audioClock_.load();
     currentFramePtsSec_ = targetPtsSec;
     updateAudioClock(targetPtsSec);
 }
@@ -318,6 +387,7 @@ void AudioOutput::setPlaybackRate(float rate)
     }
 
     playbackRate_.store(clamped);
+    VP_INFO("AudioOutput playback rate changed old={} new={}", old, clamped);
     resampleBufferSize_ = 0;
     resampleBufferOffset_ = 0;
     releaseTempoFilterLocked();
@@ -431,14 +501,6 @@ void AudioOutput::fillStream(uint8_t* stream, int len)
             static_cast<double>(consumedSamples) / actualParams_.sampleRate * rate -
             bufferedSec * rate;
         // 高频路径，节流：每 50 次回调（约 1s）打一次
-        static thread_local int s_logCounter = 0;
-        if ((++s_logCounter % 50) == 0) {
-            VP_LOG_DEBUG() << "fillStream pts=" << pts
-                           << " currentFramePts=" << currentFramePtsSec_
-                           << " bufferedSec=" << bufferedSec
-                           << " rate=" << rate
-                           << " prevAudioClock=" << audioClock_.load();
-        }
         updateAudioClock(pts);
     }
 }
@@ -573,8 +635,6 @@ int AudioOutput::feedTempoInputLocked()
         }
 
         if (pktQueue && frameSerial != pktQueue->currentSerial()) {
-            VP_LOG_DEBUG() << "drop stale audio frame serial=" << frameSerial
-                           << " current=" << pktQueue->currentSerial();
             av_frame_free(&frame);
             frame = nullptr;
             continue;
@@ -596,9 +656,6 @@ int AudioOutput::feedTempoInputLocked()
             const double endPts =
                 framePtsSec + static_cast<double>(frame->nb_samples) / frameSampleRate;
             if (endPts <= seekTargetPtsSec_) {
-                VP_LOG_DEBUG() << "drop pre-target audio frame serial=" << frameSerial
-                               << " pts=" << framePtsSec
-                               << " target=" << seekTargetPtsSec_;
                 av_frame_free(&frame);
                 frame = nullptr;
                 continue;
@@ -701,6 +758,7 @@ int AudioOutput::feedTempoInputLocked()
     if (ret > 0) {
         pcmFrame->nb_samples = ret;
         pcmFrame->pts = tempoInputPtsSamples_;
+        const bool firstTempoInput = tempoInputPtsSamples_ == 0;
         tempoInputPtsSamples_ += ret;
         const int addRet = av_buffersrc_add_frame_flags(tempoSrcCtx_,
                                                         pcmFrame,
@@ -712,15 +770,16 @@ int AudioOutput::feedTempoInputLocked()
             return -1;
         }
 
+        if (firstTempoInput) {
+            VP_DEBUG("feeding first atempo input samples={} pts_samples={} source_pts_sec={} skip_samples={} source_sample_rate={}",
+                     ret, pcmFrame->pts, newFramePts, skipSamples, frameSampleRate);
+        }
+
         // atempo may emit samples from a short mixed window; using the newest
         // fed source PTS keeps the audio master clock bounded to that delay.
         currentFramePtsSec_ = newFramePts;
         tempoInputEof_ = false;
         eofReported_ = false;
-        VP_LOG_DEBUG() << "feed tempo input pts=" << newFramePts
-                       << " samples=" << ret
-                       << " rate=" << playbackRate_.load()
-                       << " serial=" << frameSerial;
     }
 
     av_frame_free(&pcmFrame);
@@ -737,67 +796,97 @@ int AudioOutput::ensureTempoFilterLocked()
 
     releaseTempoFilterLocked();
 
+    if (actualParams_.sampleRate <= 0 || actualParams_.channels <= 0) {
+        const int ret = AVERROR(EINVAL);
+        VP_ERROR("cannot create atempo graph: invalid actual audio params sample_rate={} channels={}",
+                 actualParams_.sampleRate, actualParams_.channels);
+        return ret;
+    }
+
     const AVFilter* abuffer = avfilter_get_by_name("abuffer");
     const AVFilter* atempo = avfilter_get_by_name("atempo");
     const AVFilter* abuffersink = avfilter_get_by_name("abuffersink");
     if (!abuffer || !atempo || !abuffersink) {
-        return AVERROR(EINVAL);
+        const int ret = AVERROR(EINVAL);
+        VP_ERROR("cannot create atempo graph: missing filter abuffer={} atempo={} abuffersink={}",
+                 static_cast<const void*>(abuffer),
+                 static_cast<const void*>(atempo),
+                 static_cast<const void*>(abuffersink));
+        return ret;
     }
 
     AVFilterGraph* graph = avfilter_graph_alloc();
     if (!graph) {
-        return AVERROR(ENOMEM);
+        const int ret = AVERROR(ENOMEM);
+        VP_ERROR("avfilter_graph_alloc failed ret={} msg={}", ret, avErrorString(ret));
+        return ret;
     }
+
+    AVChannelLayout srcLayout{};
+    av_channel_layout_default(&srcLayout, actualParams_.channels);
+    const std::string srcLayoutDesc = channelLayoutString(srcLayout, actualParams_.channels);
+    av_channel_layout_uninit(&srcLayout);
+
+    char srcArgs[256] = {};
+    std::snprintf(srcArgs,
+                  sizeof(srcArgs),
+                  "time_base=1/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
+                  actualParams_.sampleRate,
+                  actualParams_.sampleRate,
+                  sampleFormatName(AV_SAMPLE_FMT_S16),
+                  srcLayoutDesc.c_str());
+
+    char tempoArgs[64] = {};
+    std::snprintf(tempoArgs, sizeof(tempoArgs), "tempo=%0.6f", static_cast<double>(rate));
+
+    VP_INFO("creating atempo graph rate={} src_args={} tempo_args={}", rate, srcArgs, tempoArgs);
 
     AVFilterContext* srcCtx = nullptr;
     AVFilterContext* tempoCtx = nullptr;
     AVFilterContext* sinkCtx = nullptr;
 
-    int ret = avfilter_graph_create_filter(&srcCtx, abuffer, "tempo_src", nullptr, nullptr, graph);
+    int ret = avfilter_graph_create_filter(&srcCtx, abuffer, "tempo_src", srcArgs, nullptr, graph);
     if (ret < 0) {
+        VP_ERROR("avfilter_graph_create_filter tempo_src failed ret={} msg={} args={}",
+                 ret, avErrorString(ret), srcArgs);
         avfilter_graph_free(&graph);
         return ret;
     }
 
-    AVBufferSrcParameters* params = av_buffersrc_parameters_alloc();
-    if (!params) {
-        avfilter_graph_free(&graph);
-        return AVERROR(ENOMEM);
-    }
-    params->format = AV_SAMPLE_FMT_S16;
-    params->time_base = AVRational{1, actualParams_.sampleRate};
-    params->sample_rate = actualParams_.sampleRate;
-    av_channel_layout_default(&params->ch_layout, actualParams_.channels);
-    ret = av_buffersrc_parameters_set(srcCtx, params);
-    av_channel_layout_uninit(&params->ch_layout);
-    av_free(params);
-    if (ret < 0) {
-        avfilter_graph_free(&graph);
-        return ret;
-    }
-
-    char tempoArgs[64] = {};
-    std::snprintf(tempoArgs, sizeof(tempoArgs), "tempo=%0.6f", static_cast<double>(rate));
     ret = avfilter_graph_create_filter(&tempoCtx, atempo, "tempo", tempoArgs, nullptr, graph);
     if (ret < 0) {
+        VP_ERROR("avfilter_graph_create_filter tempo failed ret={} msg={} args={}",
+                 ret, avErrorString(ret), tempoArgs);
         avfilter_graph_free(&graph);
         return ret;
     }
 
     ret = avfilter_graph_create_filter(&sinkCtx, abuffersink, "tempo_sink", nullptr, nullptr, graph);
     if (ret < 0) {
+        VP_ERROR("avfilter_graph_create_filter tempo_sink failed ret={} msg={}",
+                 ret, avErrorString(ret));
         avfilter_graph_free(&graph);
         return ret;
     }
 
     ret = avfilter_link(srcCtx, 0, tempoCtx, 0);
-    if (ret >= 0) {
-        ret = avfilter_link(tempoCtx, 0, sinkCtx, 0);
-    }
-    if (ret >= 0) {
-        ret = avfilter_graph_config(graph, nullptr);
-    }
     if (ret < 0) {
+        VP_ERROR("avfilter_link tempo_src->tempo failed ret={} msg={}", ret, avErrorString(ret));
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    ret = avfilter_link(tempoCtx, 0, sinkCtx, 0);
+    if (ret < 0) {
+        VP_ERROR("avfilter_link tempo->tempo_sink failed ret={} msg={}", ret, avErrorString(ret));
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    ret = avfilter_graph_config(graph, nullptr);
+    if (ret < 0) {
+        VP_ERROR("avfilter_graph_config atempo graph failed ret={} msg={} src_args={} tempo_args={}",
+                 ret, avErrorString(ret), srcArgs, tempoArgs);
         avfilter_graph_free(&graph);
         return ret;
     }
@@ -808,12 +897,19 @@ int AudioOutput::ensureTempoFilterLocked()
     tempoPlaybackRate_ = rate;
     tempoInputEof_ = false;
     tempoInputPtsSamples_ = 0;
+    VP_INFO("atempo graph ready rate={} sample_rate={} channels={} sample_fmt={} channel_layout={}",
+            rate,
+            actualParams_.sampleRate,
+            actualParams_.channels,
+            sampleFormatName(AV_SAMPLE_FMT_S16),
+            srcLayoutDesc);
     return 0;
 }
 
 void AudioOutput::releaseTempoFilterLocked()
 {
     if (tempoGraph_) {
+        VP_DEBUG("releasing atempo graph rate={}", tempoPlaybackRate_);
         avfilter_graph_free(&tempoGraph_);
     }
     tempoSrcCtx_ = nullptr;
@@ -924,6 +1020,7 @@ FrameQueue* AudioOutput::frameQueueSnapshot() const
 
 void AudioOutput::reportError(int errCode, const std::string& msg)
 {
+    VP_ERROR("AudioOutput error code={} msg={}", errCode, msg);
     if (errorCb_) {
         errorCb_(errCode, msg);
     }

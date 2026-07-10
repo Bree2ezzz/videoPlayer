@@ -1,7 +1,13 @@
 #include "openglrenderer.h"
 
+#include "app_logger.h"
+
 #include <QMetaObject>
 #include <QOpenGLShaderProgram>
+
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 #include <QThread>
 
 #include <algorithm>
@@ -13,6 +19,24 @@
 
 namespace {
 
+const char* pixelFormatName(AVPixelFormat format)
+{
+    const char* name = av_get_pix_fmt_name(format);
+    return name ? name : "unknown";
+}
+
+const char* uploadFormatName(int format)
+{
+    switch (format) {
+    case 0:
+        return "None";
+    case 1:
+        return "Yuv420p";
+    case 2:
+        return "Nv12";
+    }
+    return "Unknown";
+}
 constexpr GLfloat kQuadVertices[] = {
     // position     // tex coord
     -1.0f, -1.0f,   0.0f, 1.0f,
@@ -123,12 +147,14 @@ OpenGLRenderer::OpenGLRenderer(QWidget* parent)
     : QOpenGLWidget(parent),
       vertexBuffer_(QOpenGLBuffer::VertexBuffer)
 {
+    VP_INFO("OpenGLRenderer created this={} parent={}", static_cast<const void*>(this), static_cast<const void*>(parent));
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAutoFillBackground(false);
 }
 
 OpenGLRenderer::~OpenGLRenderer()
 {
+    VP_INFO("OpenGLRenderer destroyed this={} context={}", static_cast<const void*>(this), static_cast<const void*>(context()));
     if (context()) {
         makeCurrent();
         releaseGlResources();
@@ -142,13 +168,41 @@ OpenGLRenderer::~OpenGLRenderer()
 void OpenGLRenderer::renderFrame(AVFrame* frame)
 {
     if (!frame) {
+        VP_WARN("OpenGLRenderer::renderFrame ignored null frame this={}", static_cast<const void*>(this));
         return;
     }
 
+    VP_DEBUG("OpenGLRenderer::renderFrame this={} frame={} size={}x{} format={} pts={} best_effort={} gui_thread={} widget_size={}x{}",
+             static_cast<const void*>(this),
+             static_cast<const void*>(frame),
+             frame->width,
+             frame->height,
+             pixelFormatName(static_cast<AVPixelFormat>(frame->format)),
+             frame->pts,
+             frame->best_effort_timestamp,
+             QThread::currentThread() == thread(),
+             width(),
+             height());
+
     FrameData copied;
     if (!copyFrame(frame, copied)) {
+        VP_WARN("OpenGLRenderer::renderFrame copyFrame failed this={} frame={} size={}x{} format={}",
+                static_cast<const void*>(this),
+                static_cast<const void*>(frame),
+                frame->width,
+                frame->height,
+                pixelFormatName(static_cast<AVPixelFormat>(frame->format)));
         return;
     }
+
+    VP_DEBUG("OpenGLRenderer copied frame this={} upload_format={} size={}x{} planes=({}, {}, {})",
+             static_cast<const void*>(this),
+             uploadFormatName(static_cast<int>(copied.format)),
+             copied.width,
+             copied.height,
+             copied.planes[0].size(),
+             copied.planes[1].size(),
+             copied.planes[2].size());
 
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
@@ -157,10 +211,12 @@ void OpenGLRenderer::renderFrame(AVFrame* frame)
     }
 
     requestUpdate();
+    VP_DEBUG("OpenGLRenderer requested update this={} pending={}", static_cast<const void*>(this), updatePending_.load());
 }
 
 void OpenGLRenderer::clear()
 {
+    VP_INFO("OpenGLRenderer::clear this={}", static_cast<const void*>(this));
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
         pendingFrame_.reset();
@@ -183,6 +239,12 @@ void OpenGLRenderer::setBackgroundColor(const QColor& color)
 
 void OpenGLRenderer::initializeGL()
 {
+    VP_INFO("OpenGLRenderer::initializeGL this={} widget={}x{} dpr={} context={}",
+            static_cast<const void*>(this),
+            width(),
+            height(),
+            devicePixelRatioF(),
+            static_cast<const void*>(context()));
     initializeOpenGLFunctions();
 
     glClearColor(backgroundColor_.redF(),
@@ -193,12 +255,16 @@ void OpenGLRenderer::initializeGL()
     program_ = new QOpenGLShaderProgram();
     if (!program_->addShaderFromSourceCode(QOpenGLShader::Vertex, vertexShaderSource()) ||
         !program_->addShaderFromSourceCode(QOpenGLShader::Fragment, fragmentShaderSource())) {
+        VP_ERROR("OpenGLRenderer shader compile failed this={} log={}",
+                 static_cast<const void*>(this), program_->log().toStdString());
         return;
     }
 
     program_->bindAttributeLocation("position", 0);
     program_->bindAttributeLocation("texCoordIn", 1);
     if (!program_->link()) {
+        VP_ERROR("OpenGLRenderer shader link failed this={} log={}",
+                 static_cast<const void*>(this), program_->log().toStdString());
         return;
     }
 
@@ -222,10 +288,19 @@ void OpenGLRenderer::initializeGL()
     vertexBuffer_.release();
 
     initializeTextures();
+    VP_INFO("OpenGLRenderer::initializeGL done this={} textures_initialized={}",
+            static_cast<const void*>(this), texturesInitialized_);
 }
 
 void OpenGLRenderer::paintGL()
 {
+    VP_DEBUG("OpenGLRenderer::paintGL begin this={} widget={}x{} dpr={} texture_ready={} program={}",
+             static_cast<const void*>(this),
+             width(),
+             height(),
+             devicePixelRatioF(),
+             textureReady_,
+             static_cast<const void*>(program_));
     glClearColor(backgroundColor_.redF(),
                  backgroundColor_.greenF(),
                  backgroundColor_.blueF(),
@@ -236,7 +311,10 @@ void OpenGLRenderer::paintGL()
     bool clearRequested = false;
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
+        const bool hadPendingFrame = pendingFrame_.isValid();
         clearRequested = clearRequested_;
+        VP_DEBUG("OpenGLRenderer::paintGL locked state this={} pending_valid={} clear_requested={}",
+                 static_cast<const void*>(this), hadPendingFrame, clearRequested);
         clearRequested_ = false;
         if (pendingFrame_.isValid()) {
             frame = std::move(pendingFrame_);
@@ -245,20 +323,34 @@ void OpenGLRenderer::paintGL()
     }
 
     if (clearRequested) {
+        VP_INFO("OpenGLRenderer::paintGL applying clear this={}", static_cast<const void*>(this));
         textureReady_ = false;
         displayedFrameSize_ = QSize();
     }
 
     if (frame.isValid()) {
+        VP_DEBUG("OpenGLRenderer::paintGL uploading pending frame this={} format={} size={}x{}",
+                 static_cast<const void*>(this), uploadFormatName(static_cast<int>(frame.format)), frame.width, frame.height);
         uploadFrame(frame);
     }
 
     if (!textureReady_ || !program_ || !program_->isLinked()) {
+        VP_DEBUG("OpenGLRenderer::paintGL skip draw this={} texture_ready={} program={} linked={}",
+                 static_cast<const void*>(this),
+                 textureReady_,
+                 static_cast<const void*>(program_),
+                 program_ ? program_->isLinked() : false);
         return;
     }
 
     const QRect target = viewportRectForFrame(displayedFrameSize_);
     if (target.isEmpty()) {
+        VP_WARN("OpenGLRenderer::paintGL empty viewport target this={} frame={}x{} widget={}x{}",
+                static_cast<const void*>(this),
+                displayedFrameSize_.width(),
+                displayedFrameSize_.height(),
+                width(),
+                height());
         return;
     }
 
@@ -280,6 +372,17 @@ void OpenGLRenderer::paintGL()
 
     QOpenGLVertexArrayObject::Binder vaoBinder(&vao_);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    const GLenum drawError = glGetError();
+    VP_DEBUG("OpenGLRenderer::paintGL draw this={} target=({},{} {}x{}) frame={}x{} upload_format={} gl_error={}",
+             static_cast<const void*>(this),
+             target.x(),
+             target.y(),
+             target.width(),
+             target.height(),
+             displayedFrameSize_.width(),
+             displayedFrameSize_.height(),
+             uploadFormatName(static_cast<int>(textureFormat_)),
+             static_cast<unsigned int>(drawError));
 
     glBindTexture(GL_TEXTURE_2D, 0);
     program_->release();
@@ -290,6 +393,8 @@ void OpenGLRenderer::paintGL()
 
 void OpenGLRenderer::resizeGL(int width, int height)
 {
+    VP_INFO("OpenGLRenderer::resizeGL this={} size={}x{} dpr={}",
+            static_cast<const void*>(this), width, height, devicePixelRatioF());
     const qreal dpr = devicePixelRatioF();
     glViewport(0, 0, static_cast<GLsizei>(width * dpr), static_cast<GLsizei>(height * dpr));
 }
@@ -297,17 +402,28 @@ void OpenGLRenderer::resizeGL(int width, int height)
 bool OpenGLRenderer::copyFrame(AVFrame* frame, FrameData& out)
 {
     if (!frame || frame->width <= 0 || frame->height <= 0) {
+        VP_WARN("OpenGLRenderer::copyFrame invalid frame this={} frame={} size={}x{}",
+                static_cast<const void*>(this),
+                static_cast<const void*>(frame),
+                frame ? frame->width : -1,
+                frame ? frame->height : -1);
         return false;
     }
 
     const AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
     if (isPlanar420Format(format)) {
+        VP_DEBUG("OpenGLRenderer::copyFrame direct planar420 this={} format={} size={}x{}",
+                 static_cast<const void*>(this), pixelFormatName(format), frame->width, frame->height);
         return copyPlanar420Frame(frame, out);
     }
     if (format == AV_PIX_FMT_NV12) {
+        VP_DEBUG("OpenGLRenderer::copyFrame direct NV12 this={} size={}x{}",
+                 static_cast<const void*>(this), frame->width, frame->height);
         return copyNv12Frame(frame, out);
     }
 
+    VP_INFO("OpenGLRenderer::copyFrame converting unsupported source format this={} format={} size={}x{}",
+            static_cast<const void*>(this), pixelFormatName(format), frame->width, frame->height);
     std::lock_guard<std::mutex> lock(convertMutex_);
     return convertFrameToYuv420p(frame, out);
 }
@@ -315,6 +431,11 @@ bool OpenGLRenderer::copyFrame(AVFrame* frame, FrameData& out)
 bool OpenGLRenderer::copyPlanar420Frame(AVFrame* frame, FrameData& out)
 {
     if (!frame->data[0] || !frame->data[1] || !frame->data[2]) {
+        VP_WARN("OpenGLRenderer::copyPlanar420Frame missing planes this={} data=({}, {}, {})",
+                static_cast<const void*>(this),
+                static_cast<const void*>(frame->data[0]),
+                static_cast<const void*>(frame->data[1]),
+                static_cast<const void*>(frame->data[2]));
         return false;
     }
 
@@ -340,6 +461,10 @@ bool OpenGLRenderer::copyPlanar420Frame(AVFrame* frame, FrameData& out)
 bool OpenGLRenderer::copyNv12Frame(AVFrame* frame, FrameData& out)
 {
     if (!frame->data[0] || !frame->data[1]) {
+        VP_WARN("OpenGLRenderer::copyNv12Frame missing planes this={} data=({}, {})",
+                static_cast<const void*>(this),
+                static_cast<const void*>(frame->data[0]),
+                static_cast<const void*>(frame->data[1]));
         return false;
     }
 
@@ -365,6 +490,8 @@ bool OpenGLRenderer::convertFrameToYuv420p(AVFrame* frame, FrameData& out)
 {
     const AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
     if (format == AV_PIX_FMT_NONE) {
+        VP_WARN("OpenGLRenderer::convertFrameToYuv420p frame has AV_PIX_FMT_NONE this={} frame={}",
+                static_cast<const void*>(this), static_cast<const void*>(frame));
         return false;
     }
 
@@ -375,6 +502,14 @@ bool OpenGLRenderer::convertFrameToYuv420p(AVFrame* frame, FrameData& out)
         swsSrcFormat_ != format;
 
     if (sourceChanged) {
+        VP_INFO("OpenGLRenderer rebuilding sws this={} source={}x{} format={} old={}x{} old_format={}",
+                static_cast<const void*>(this),
+                frame->width,
+                frame->height,
+                pixelFormatName(format),
+                swsSrcWidth_,
+                swsSrcHeight_,
+                pixelFormatName(swsSrcFormat_));
         releaseSwsResources();
         swsCtx_ = sws_getContext(frame->width,
                                  frame->height,
@@ -387,6 +522,11 @@ bool OpenGLRenderer::convertFrameToYuv420p(AVFrame* frame, FrameData& out)
                                  nullptr,
                                  nullptr);
         if (!swsCtx_) {
+            VP_ERROR("OpenGLRenderer sws_getContext failed this={} source={}x{} format={}",
+                     static_cast<const void*>(this),
+                     frame->width,
+                     frame->height,
+                     pixelFormatName(format));
             return false;
         }
         swsSrcWidth_ = frame->width;
@@ -423,6 +563,8 @@ bool OpenGLRenderer::convertFrameToYuv420p(AVFrame* frame, FrameData& out)
                                     dstData,
                                     dstLinesize);
     if (converted != frame->height) {
+        VP_ERROR("OpenGLRenderer sws_scale returned unexpected height this={} converted={} expected={}",
+                 static_cast<const void*>(this), converted, frame->height);
         out.reset();
         return false;
     }
@@ -450,8 +592,12 @@ void OpenGLRenderer::requestUpdate()
 
 void OpenGLRenderer::uploadFrame(const FrameData& frame)
 {
+    VP_DEBUG("OpenGLRenderer::uploadFrame this={} format={} size={}x{}",
+             static_cast<const void*>(this), uploadFormatName(static_cast<int>(frame.format)), frame.width, frame.height);
     ensureTextureStorage(frame);
     if (!texturesInitialized_) {
+        VP_ERROR("OpenGLRenderer textures are not initialized this={}",
+                 static_cast<const void*>(this));
         return;
     }
 
@@ -510,6 +656,8 @@ void OpenGLRenderer::uploadFrame(const FrameData& frame)
     glBindTexture(GL_TEXTURE_2D, 0);
     textureReady_ = true;
     displayedFrameSize_ = QSize(frame.width, frame.height);
+    VP_DEBUG("OpenGLRenderer::uploadFrame done this={} texture_ready={} displayed={}x{}",
+             static_cast<const void*>(this), textureReady_, displayedFrameSize_.width(), displayedFrameSize_.height());
 }
 
 void OpenGLRenderer::ensureTextureStorage(const FrameData& frame)
@@ -518,6 +666,8 @@ void OpenGLRenderer::ensureTextureStorage(const FrameData& frame)
         initializeTextures();
     }
     if (!texturesInitialized_) {
+        VP_ERROR("OpenGLRenderer textures are not initialized this={}",
+                 static_cast<const void*>(this));
         return;
     }
 
@@ -526,6 +676,15 @@ void OpenGLRenderer::ensureTextureStorage(const FrameData& frame)
         textureFormat_ == frame.format) {
         return;
     }
+
+    VP_INFO("OpenGLRenderer allocating texture storage this={} old={}x{} old_format={} new={}x{} new_format={}",
+            static_cast<const void*>(this),
+            textureWidth_,
+            textureHeight_,
+            uploadFormatName(static_cast<int>(textureFormat_)),
+            frame.width,
+            frame.height,
+            uploadFormatName(static_cast<int>(frame.format)));
 
     const int chromaWidth = chromaSize(frame.width);
     const int chromaHeight = chromaSize(frame.height);
@@ -599,11 +758,21 @@ void OpenGLRenderer::initializeTextures()
     }
     glBindTexture(GL_TEXTURE_2D, 0);
     texturesInitialized_ = true;
+    VP_INFO("OpenGLRenderer textures initialized this={} ids=({}, {}, {})",
+            static_cast<const void*>(this),
+            static_cast<unsigned int>(textures_[0]),
+            static_cast<unsigned int>(textures_[1]),
+            static_cast<unsigned int>(textures_[2]));
 }
 
 void OpenGLRenderer::releaseGlResources()
 {
     if (texturesInitialized_) {
+        VP_INFO("OpenGLRenderer deleting textures this={} ids=({}, {}, {})",
+                static_cast<const void*>(this),
+                static_cast<unsigned int>(textures_[0]),
+                static_cast<unsigned int>(textures_[1]),
+                static_cast<unsigned int>(textures_[2]));
         glDeleteTextures(3, textures_);
         textures_[0] = textures_[1] = textures_[2] = 0;
         texturesInitialized_ = false;
@@ -625,6 +794,8 @@ void OpenGLRenderer::releaseGlResources()
 void OpenGLRenderer::releaseSwsResources()
 {
     if (swsCtx_) {
+        VP_DEBUG("OpenGLRenderer releasing sws this={} source={}x{} format={}",
+                 static_cast<const void*>(this), swsSrcWidth_, swsSrcHeight_, pixelFormatName(swsSrcFormat_));
         sws_freeContext(swsCtx_);
         swsCtx_ = nullptr;
     }
