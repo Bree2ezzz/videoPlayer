@@ -3,13 +3,17 @@
 #include "logging.h"
 
 extern "C" {
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavutil/avutil.h>
 #include <libavutil/error.h>
+#include <libavutil/mem.h>
 }
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -33,13 +37,6 @@ double steadySeconds()
 int sdlErrorCode()
 {
     return AVERROR_EXTERNAL;
-}
-
-int scaledOutputSampleRate(int deviceSampleRate, float playbackRate)
-{
-    const float rate = std::clamp(playbackRate, 0.5f, 2.0f);
-    const double scaled = static_cast<double>(deviceSampleRate) / rate;
-    return std::max(1, static_cast<int>(std::lround(scaled)));
 }
 
 } // namespace
@@ -142,6 +139,9 @@ int AudioOutput::open(const AVCodecParameters* sourceCodecpar,
     currentFramePtsSec_ = 0.0;
     seekTargetPtsSec_ = -1.0;
     seekSerial_ = -1;
+    tempoInputEof_ = false;
+    tempoInputPtsSamples_ = 0;
+    tempoPlaybackRate_ = 0.0f;
     updateAudioClock(0.0);
     return 0;
 }
@@ -160,13 +160,15 @@ void AudioOutput::close()
         if (swrCtx_) {
             swr_free(&swrCtx_);
         }
-        swrPlaybackRate_ = 1.0f;
+        releaseTempoFilterLocked();
         resampleBuffer_.clear();
         resampleBufferSize_ = 0;
         resampleBufferOffset_ = 0;
         currentFramePtsSec_ = 0.0;
         seekTargetPtsSec_ = -1.0;
         seekSerial_ = -1;
+        tempoInputEof_ = false;
+        tempoInputPtsSamples_ = 0;
     }
 
     av_channel_layout_uninit(&srcChLayout_);
@@ -255,6 +257,7 @@ void AudioOutput::flush()
     resampleBufferSize_ = 0;
     resampleBufferOffset_ = 0;
     eofReported_ = false;
+    releaseTempoFilterLocked();
 
     if (device_) {
         SDL_ClearQueuedAudio(device_);
@@ -271,6 +274,7 @@ void AudioOutput::seekTo(double targetPtsSec, int serial)
     resampleBufferSize_ = 0;
     resampleBufferOffset_ = 0;
     eofReported_ = false;
+    releaseTempoFilterLocked();
     seekTargetPtsSec_ = targetPtsSec;
     seekSerial_ = serial;
 
@@ -316,14 +320,7 @@ void AudioOutput::setPlaybackRate(float rate)
     playbackRate_.store(clamped);
     resampleBufferSize_ = 0;
     resampleBufferOffset_ = 0;
-    if (swrCtx_) {
-        swr_free(&swrCtx_);
-    }
-    swrPlaybackRate_ = 0.0f;
-
-    if (device_) {
-        SDL_ClearQueuedAudio(device_);
-    }
+    releaseTempoFilterLocked();
 
     updateAudioClock(audioClock_.load());
 }
@@ -448,6 +445,93 @@ void AudioOutput::fillStream(uint8_t* stream, int len)
 
 int AudioOutput::refillResampleBuffer()
 {
+    while (true) {
+        const int outputRet = receiveTempoOutputLocked();
+        if (outputRet != 0) {
+            return outputRet;
+        }
+
+        const int feedRet = feedTempoInputLocked();
+        if (feedRet <= 0) {
+            return feedRet;
+        }
+    }
+}
+
+int AudioOutput::receiveTempoOutputLocked()
+{
+    if (!tempoSinkCtx_) {
+        return 0;
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) {
+        return -1;
+    }
+
+    const int ret = av_buffersink_get_frame(tempoSinkCtx_, frame);
+    if (ret == AVERROR(EAGAIN)) {
+        av_frame_free(&frame);
+        return 0;
+    }
+    if (ret == AVERROR_EOF) {
+        av_frame_free(&frame);
+        if (!eofReported_.exchange(true) && eofCb_) {
+            eofCb_();
+        }
+        return 0;
+    }
+    if (ret < 0) {
+        reportError(ret, "av_buffersink_get_frame failed: " + avErrorString(ret));
+        av_frame_free(&frame);
+        return -1;
+    }
+
+    const AVSampleFormat format = static_cast<AVSampleFormat>(frame->format);
+    const int channels = frame->ch_layout.nb_channels > 0
+                             ? frame->ch_layout.nb_channels
+                             : actualParams_.channels;
+    if (frame->sample_rate != actualParams_.sampleRate ||
+        channels != actualParams_.channels ||
+        frame->nb_samples <= 0) {
+        av_frame_free(&frame);
+        return 0;
+    }
+
+    const int outputBytes = frame->nb_samples * actualParams_.channels * bytesPerSample_;
+    if (outputBytes <= 0) {
+        av_frame_free(&frame);
+        return 0;
+    }
+    if (static_cast<int>(resampleBuffer_.size()) < outputBytes) {
+        resampleBuffer_.resize(outputBytes);
+    }
+
+    if (format == AV_SAMPLE_FMT_S16) {
+        std::memcpy(resampleBuffer_.data(), frame->data[0], static_cast<size_t>(outputBytes));
+    } else if (format == AV_SAMPLE_FMT_S16P) {
+        auto* dst = reinterpret_cast<int16_t*>(resampleBuffer_.data());
+        for (int sample = 0; sample < frame->nb_samples; ++sample) {
+            for (int ch = 0; ch < channels; ++ch) {
+                const auto* src = reinterpret_cast<const int16_t*>(frame->extended_data[ch]);
+                dst[sample * channels + ch] = src[sample];
+            }
+        }
+    } else {
+        const int err = AVERROR(EINVAL);
+        reportError(err, "atempo produced unsupported sample format");
+        av_frame_free(&frame);
+        return -1;
+    }
+
+    resampleBufferSize_ = outputBytes;
+    resampleBufferOffset_ = 0;
+    av_frame_free(&frame);
+    return resampleBufferSize_;
+}
+
+int AudioOutput::feedTempoInputLocked()
+{
     FrameQueue* queue = nullptr;
     PacketQueue* pktQueue = nullptr;
     {
@@ -459,7 +543,6 @@ int AudioOutput::refillResampleBuffer()
         return 0;
     }
 
-    // 在单次 SDL 回调内一次性吃掉旧 serial 帧以及精确 seek 目标前的帧。
     AVFrame* frame = nullptr;
     int frameSerial = -1;
     int skipSamples = 0;
@@ -471,6 +554,15 @@ int AudioOutput::refillResampleBuffer()
             return 0;
         }
         if (popRet == FrameQueue::EndOfStream) {
+            if (tempoSrcCtx_ && !tempoInputEof_) {
+                const int closeRet = av_buffersrc_close(tempoSrcCtx_, AV_NOPTS_VALUE, 0);
+                if (closeRet < 0) {
+                    reportError(closeRet, "av_buffersrc_close failed: " + avErrorString(closeRet));
+                    return -1;
+                }
+                tempoInputEof_ = true;
+                return 1;
+            }
             if (!eofReported_.exchange(true) && eofCb_) {
                 eofCb_();
             }
@@ -521,7 +613,6 @@ int AudioOutput::refillResampleBuffer()
             seekTargetPtsSec_ = -1.0;
             seekSerial_ = -1;
         } else if (frameSerial == seekSerial_ && seekTargetPtsSec_ >= 0.0) {
-            // 没有可用 PTS 时不能安全裁剪；消费第一帧并停止过滤，避免静音卡死。
             seekTargetPtsSec_ = -1.0;
             seekSerial_ = -1;
         }
@@ -539,18 +630,37 @@ int AudioOutput::refillResampleBuffer()
         av_frame_free(&frame);
         return -1;
     }
+
+    ret = ensureTempoFilterLocked();
+    if (ret < 0) {
+        reportError(ret, "ensureTempoFilterLocked failed: " + avErrorString(ret));
+        av_frame_free(&frame);
+        return -1;
+    }
+
     const int inputSamples = frame->nb_samples - skipSamples;
-    //预估输出buffer需要多大,为了防止swr_convert写爆内存
     const int outSamples = swr_get_out_samples(swrCtx_, inputSamples);
     if (outSamples <= 0) {
-        //小于等于0出现直接return，不去处理这一frame
         av_frame_free(&frame);
-        return 0;
+        return 1;
     }
-    //单通道输出样本数*通道数*每个样本多少字节  是一个安全上限
-    const int outBytes = outSamples * actualParams_.channels * bytesPerSample_;
-    if (static_cast<int>(resampleBuffer_.size()) < outBytes) {
-        resampleBuffer_.resize(outBytes);
+
+    AVFrame* pcmFrame = av_frame_alloc();
+    if (!pcmFrame) {
+        av_frame_free(&frame);
+        return -1;
+    }
+
+    pcmFrame->format = AV_SAMPLE_FMT_S16;
+    pcmFrame->sample_rate = actualParams_.sampleRate;
+    pcmFrame->nb_samples = outSamples;
+    av_channel_layout_default(&pcmFrame->ch_layout, actualParams_.channels);
+    ret = av_frame_get_buffer(pcmFrame, 0);
+    if (ret < 0) {
+        reportError(ret, "av_frame_get_buffer failed: " + avErrorString(ret));
+        av_frame_free(&pcmFrame);
+        av_frame_free(&frame);
+        return -1;
     }
 
     const AVSampleFormat inputFormat = static_cast<AVSampleFormat>(frame->format);
@@ -561,6 +671,7 @@ int AudioOutput::refillResampleBuffer()
                              : srcChLayout_.nb_channels;
     const int planes = planar ? channels : 1;
     if (inputBytesPerSample <= 0 || channels <= 0 || planes <= 0) {
+        av_frame_free(&pcmFrame);
         av_frame_free(&frame);
         return -1;
     }
@@ -571,31 +682,145 @@ int AudioOutput::refillResampleBuffer()
         inputData[plane] = frame->extended_data[plane] + skipSamples * step;
     }
 
-    uint8_t* outPtr = resampleBuffer_.data();
     ret = swr_convert(swrCtx_,
-                      &outPtr,
+                      pcmFrame->data,
                       outSamples,
                       inputData.data(),
                       inputSamples);
     if (ret < 0) {
         reportError(ret, "swr_convert failed: " + avErrorString(ret));
+        av_frame_free(&pcmFrame);
         av_frame_free(&frame);
         return -1;
     }
-    //这里计算的是实际产生的数据量
-    resampleBufferSize_ = ret * actualParams_.channels * bytesPerSample_;
-    resampleBufferOffset_ = 0;
+
     const double newFramePts =
         framePtsSec + (frameSampleRate > 0
                            ? static_cast<double>(skipSamples) / frameSampleRate
                            : 0.0);
-    VP_LOG_DEBUG() << "refill new frame pts=" << newFramePts
-                   << " prevCurrentFramePts=" << currentFramePtsSec_
-                   << " serial=" << frameSerial;
-    currentFramePtsSec_ = newFramePts;
+    if (ret > 0) {
+        pcmFrame->nb_samples = ret;
+        pcmFrame->pts = tempoInputPtsSamples_;
+        tempoInputPtsSamples_ += ret;
+        const int addRet = av_buffersrc_add_frame_flags(tempoSrcCtx_,
+                                                        pcmFrame,
+                                                        AV_BUFFERSRC_FLAG_KEEP_REF);
+        if (addRet < 0) {
+            reportError(addRet, "av_buffersrc_add_frame_flags failed: " + avErrorString(addRet));
+            av_frame_free(&pcmFrame);
+            av_frame_free(&frame);
+            return -1;
+        }
 
+        // atempo may emit samples from a short mixed window; using the newest
+        // fed source PTS keeps the audio master clock bounded to that delay.
+        currentFramePtsSec_ = newFramePts;
+        tempoInputEof_ = false;
+        eofReported_ = false;
+        VP_LOG_DEBUG() << "feed tempo input pts=" << newFramePts
+                       << " samples=" << ret
+                       << " rate=" << playbackRate_.load()
+                       << " serial=" << frameSerial;
+    }
+
+    av_frame_free(&pcmFrame);
     av_frame_free(&frame);
-    return resampleBufferSize_;
+    return 1;
+}
+
+int AudioOutput::ensureTempoFilterLocked()
+{
+    const float rate = std::clamp(playbackRate_.load(), 0.5f, 2.0f);
+    if (tempoGraph_ && std::fabs(tempoPlaybackRate_ - rate) < 0.0001f) {
+        return 0;
+    }
+
+    releaseTempoFilterLocked();
+
+    const AVFilter* abuffer = avfilter_get_by_name("abuffer");
+    const AVFilter* atempo = avfilter_get_by_name("atempo");
+    const AVFilter* abuffersink = avfilter_get_by_name("abuffersink");
+    if (!abuffer || !atempo || !abuffersink) {
+        return AVERROR(EINVAL);
+    }
+
+    AVFilterGraph* graph = avfilter_graph_alloc();
+    if (!graph) {
+        return AVERROR(ENOMEM);
+    }
+
+    AVFilterContext* srcCtx = nullptr;
+    AVFilterContext* tempoCtx = nullptr;
+    AVFilterContext* sinkCtx = nullptr;
+
+    int ret = avfilter_graph_create_filter(&srcCtx, abuffer, "tempo_src", nullptr, nullptr, graph);
+    if (ret < 0) {
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    AVBufferSrcParameters* params = av_buffersrc_parameters_alloc();
+    if (!params) {
+        avfilter_graph_free(&graph);
+        return AVERROR(ENOMEM);
+    }
+    params->format = AV_SAMPLE_FMT_S16;
+    params->time_base = AVRational{1, actualParams_.sampleRate};
+    params->sample_rate = actualParams_.sampleRate;
+    av_channel_layout_default(&params->ch_layout, actualParams_.channels);
+    ret = av_buffersrc_parameters_set(srcCtx, params);
+    av_channel_layout_uninit(&params->ch_layout);
+    av_free(params);
+    if (ret < 0) {
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    char tempoArgs[64] = {};
+    std::snprintf(tempoArgs, sizeof(tempoArgs), "tempo=%0.6f", static_cast<double>(rate));
+    ret = avfilter_graph_create_filter(&tempoCtx, atempo, "tempo", tempoArgs, nullptr, graph);
+    if (ret < 0) {
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    ret = avfilter_graph_create_filter(&sinkCtx, abuffersink, "tempo_sink", nullptr, nullptr, graph);
+    if (ret < 0) {
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    ret = avfilter_link(srcCtx, 0, tempoCtx, 0);
+    if (ret >= 0) {
+        ret = avfilter_link(tempoCtx, 0, sinkCtx, 0);
+    }
+    if (ret >= 0) {
+        ret = avfilter_graph_config(graph, nullptr);
+    }
+    if (ret < 0) {
+        avfilter_graph_free(&graph);
+        return ret;
+    }
+
+    tempoGraph_ = graph;
+    tempoSrcCtx_ = srcCtx;
+    tempoSinkCtx_ = sinkCtx;
+    tempoPlaybackRate_ = rate;
+    tempoInputEof_ = false;
+    tempoInputPtsSamples_ = 0;
+    return 0;
+}
+
+void AudioOutput::releaseTempoFilterLocked()
+{
+    if (tempoGraph_) {
+        avfilter_graph_free(&tempoGraph_);
+    }
+    tempoSrcCtx_ = nullptr;
+    tempoSinkCtx_ = nullptr;
+    tempoPlaybackRate_ = 0.0f;
+    tempoInputEof_ = false;
+    tempoInputPtsSamples_ = 0;
 }
 
 int AudioOutput::ensureSwrContextLocked(const AVFrame* frame)
@@ -628,12 +853,10 @@ int AudioOutput::ensureSwrContextLocked(const AVFrame* frame)
         return ret;
     }
 
-    const float rate = std::clamp(playbackRate_.load(), 0.5f, 2.0f);
     const bool sameSource =
         swrCtx_ &&
         srcSampleFormat_ == frameFormat &&
         srcSampleRate_ == frameSampleRate &&
-        std::fabs(swrPlaybackRate_ - rate) < 0.0001f &&
         av_channel_layout_compare(&srcChLayout_, &frameLayout) == 0;
 
     if (sameSource) {
@@ -656,12 +879,10 @@ int AudioOutput::ensureSwrContextLocked(const AVFrame* frame)
 
     srcSampleFormat_ = frameFormat;
     srcSampleRate_ = frameSampleRate;
-    swrPlaybackRate_ = rate;
 
     AVChannelLayout dstLayout{};
     av_channel_layout_default(&dstLayout, actualParams_.channels);
-    const int outputSampleRate =
-        scaledOutputSampleRate(actualParams_.sampleRate, rate);
+    const int outputSampleRate = actualParams_.sampleRate;
     //格式转换协议   2. 3. 4.希望转换成什么样子去给到声卡  5. 6. 7.输入的音频长什么样
     ret = swr_alloc_set_opts2(&swrCtx_,
                               &dstLayout,

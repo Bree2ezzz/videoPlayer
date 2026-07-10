@@ -6,6 +6,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/rational.h>
 #include <libavutil/samplefmt.h>
@@ -147,6 +148,10 @@ private:
     // 从 FrameQueue 取一帧并重采样到 resampleBuffer_ 中。
     // 返回本次重采样后可用的字节数；EOF 或 Abort 返回 0；失败返回 -1。
     int refillResampleBuffer();
+    int receiveTempoOutputLocked();
+    int feedTempoInputLocked();
+    int ensureTempoFilterLocked();
+    void releaseTempoFilterLocked();
 
     // 根据源 frame 惰性重建 SwrContext（源格式可能在流切换时变化）。
     // 调用者需已持有 callbackMutex_。
@@ -175,13 +180,19 @@ private:
 
     // ---------- 重采样 ----------
     SwrContext* swrCtx_ = nullptr;
-    float swrPlaybackRate_ = 1.0f;      // swrCtx_ 创建时使用的播放速率
     std::vector<uint8_t> resampleBuffer_; // 一帧重采样输出的临时缓冲
     int resampleBufferSize_ = 0;          // 缓冲中可用字节数
     int resampleBufferOffset_ = 0;        // 已经被回调消费的字节数
     double currentFramePtsSec_ = 0.0;     // 当前 buffer 对应源 frame 的 pts（秒）
     double seekTargetPtsSec_ = -1.0;      // >= 0 时过滤 seekSerial_ 的目标前音频
     int seekSerial_ = -1;
+
+    AVFilterGraph* tempoGraph_ = nullptr;
+    AVFilterContext* tempoSrcCtx_ = nullptr;
+    AVFilterContext* tempoSinkCtx_ = nullptr;
+    float tempoPlaybackRate_ = 0.0f;
+    bool tempoInputEof_ = false;
+    int64_t tempoInputPtsSamples_ = 0;
 
     // ---------- SDL 设备 ----------
     SDL_AudioDeviceID device_ = 0;

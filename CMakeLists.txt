@@ -35,6 +35,7 @@ target_include_directories(videoplayer PRIVATE "${FFMPEG_DIR}/include" "${SDL2_D
 target_link_directories(videoplayer PRIVATE "${FFMPEG_DIR}/lib" "${SDL2_DIR}/lib")
 target_link_libraries(videoplayer PRIVATE Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets avformat
     avcodec
+    avfilter
     avutil
     swscale
     swresample

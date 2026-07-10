@@ -13,7 +13,7 @@
 - 打开媒体时使用后台线程执行 FFmpeg 输入探测，避免 UI 冻结。
 - 网络流打开和读取配置超时，断流后按指数退避重连。
 - Video rendering supports Software and OpenGL paths: Software uses sws_scale/QImage; OpenGL uploads YUV420P/NV12 textures and converts to RGB in the fragment shader.
-- 音频输出使用 SDL2 callback，音频重采样使用 libswresample。
+- Audio output uses SDL2 callback; libswresample converts to the device format, and FFmpeg atempo provides tempo change without pitch shift.
 - 音视频同步采用 Audio Master：音频时钟作为主时钟，视频侧调整显示时机并丢弃落后帧。
 
 ## Architecture
@@ -49,7 +49,7 @@ flowchart LR
 - `decoder.h/.cpp`: 音频/视频解码线程，消费 PacketQueue，输出 FrameQueue。
 - `PacketQueue.h`: packet 有界队列，带 serial，用于识别 seek 后的新旧数据边界。
 - `FrameQueue.h`: frame 有界队列，frame 入队时携带 packet serial。
-- `audiooutput.h/.cpp`: SDL2 音频设备、重采样、音量、倍速和音频时钟。
+- `audiooutput.h/.cpp`: SDL2 audio device, resampling, volume, atempo-based tempo change without pitch shift, and audio clock.
 - `renderscheduler.h/.cpp`: 视频显示调度，按源帧率或音频主时钟计算显示时机。
 - `avsync.h/.cpp`: Audio Master 同步策略，参考 ffplay 的 target delay 思路。
 - `softwarerenderer.h/.cpp`: 软件渲染，把 AVFrame 转成 QImage 并在 QWidget 中绘制。
@@ -81,6 +81,8 @@ cmake --build build-mingw -j 8
 - 拖动进度条到前中后多个位置，画面没有旧帧残留，声音能跟上。
 - Switch Software/OpenGL from the Renderer menu or bottom button, then open the same video and compare aspect ratio, color, and seek behavior.
 - Enable Hardware Decoding and play H.264/H.265; unsupported platforms/codecs should fall back to software decoding without failing playback.
+- Check 0.5x / 1.0x / 1.5x / 2.0x playback: tempo should change while pitch stays natural.
+- Seek while playing at non-1.0x speed; old audio should not leak from the tempo filter buffer.
 - 暂停后执行 `+1帧` 和 `-1帧`，画面按帧刷新。
 - 打开网络流，断流时能给出错误提示并进入重连流程。
 
