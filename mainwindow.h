@@ -2,6 +2,7 @@
 #define MAINWINDOW_H
 
 #include "playbackcontroller.h"
+#include "streampipeline.h"
 
 #include <QMainWindow>
 #include <QString>
@@ -52,9 +53,14 @@ protected:
 private slots:
     void onOpenFile();
     void onOpenUrl();
+    void onStartRtmpStream();
+    void onStopRtmpStream();
     void onSwitchRenderer();
     void onToggleFullscreen();
     void onAbout();
+    void onStreamStateChanged(StreamPipeline::State state);
+    void onStreamErrorOccurred(int errCode, const QString& message);
+    void onStreamFinished();
     void onPlaybackSessionChanged(unsigned long long sessionId, const QUrl& url);
     void onD3D11FallbackRequested(unsigned long long sessionId,
                                    const QUrl& url,
@@ -72,6 +78,7 @@ private:
     void activateProfile(PlaybackProfile profile, bool reopenMedia);
     void updateD3D11RendererSession();
     void updateProfileActions();
+    void updateStreamActions();
 
     void setupControlsWidget();
     void updateControlsState();
@@ -88,6 +95,7 @@ private:
     Ui::MainWindow* ui_ = nullptr;
 
     PlaybackController* controller_ = nullptr;
+    StreamPipeline* streamPipeline_ = nullptr;
     VideoRendererBase* renderer_ = nullptr;
     PlaybackProfile playbackProfile_ = PlaybackProfile::Software;
     std::unique_ptr<D3D11Context> d3d11Context_;
@@ -113,6 +121,8 @@ private:
     QLabel* statusLabel_ = nullptr;
     QAction* softwareProfileAction_ = nullptr;
     QAction* d3d11ProfileAction_ = nullptr;
+    QAction* startStreamAction_ = nullptr;
+    QAction* stopStreamAction_ = nullptr;
 };
 
 #endif // MAINWINDOW_H

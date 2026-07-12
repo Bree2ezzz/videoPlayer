@@ -17,6 +17,10 @@ qt_add_executable(videoplayer
     mainwindow.ui
     demuxer.h demuxer.cpp
     decoder.h decoder.cpp
+    encoder.h encoder.cpp
+    muxer.h muxer.cpp
+    streampipeline.h streampipeline.cpp
+    streamoutputoptions.h
     audiooutput.h audiooutput.cpp
     playbackcontroller.h playbackcontroller.cpp
     videorendererbase.h videorendererbase.cpp

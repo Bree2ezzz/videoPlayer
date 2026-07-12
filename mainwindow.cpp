@@ -11,8 +11,11 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QCloseEvent>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QEvent>
 #include <QFileDialog>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -26,6 +29,7 @@
 #include <QObject>
 #include <QPushButton>
 #include <QSizePolicy>
+#include <QSpinBox>
 #include <QSlider>
 #include <QStatusBar>
 #include <QVBoxLayout>
@@ -101,7 +105,8 @@ QString playbackRateText(float rate)
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent),
       ui_(new Ui::MainWindow),
-      controller_(new PlaybackController(this))
+      controller_(new PlaybackController(this)),
+      streamPipeline_(new StreamPipeline(this))
 {
     ui_->setupUi(this);
     setWindowTitle(QStringLiteral("VideoPlayer"));
@@ -146,6 +151,8 @@ MainWindow::MainWindow(QWidget* parent)
     QMenu* fileMenu = menuBar()->addMenu(QStringLiteral("File"));
     QAction* openFileAction = fileMenu->addAction(QStringLiteral("Open File..."));
     QAction* openUrlAction = fileMenu->addAction(QStringLiteral("Open URL..."));
+    startStreamAction_ = fileMenu->addAction(QStringLiteral("Start RTMP Stream..."));
+    stopStreamAction_ = fileMenu->addAction(QStringLiteral("Stop RTMP Stream"));
     fileMenu->addSeparator();
     QAction* exitAction = fileMenu->addAction(QStringLiteral("Exit"));
 
@@ -168,6 +175,8 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(openFileAction, &QAction::triggered, this, &MainWindow::onOpenFile);
     connect(openUrlAction, &QAction::triggered, this, &MainWindow::onOpenUrl);
+    connect(startStreamAction_, &QAction::triggered, this, &MainWindow::onStartRtmpStream);
+    connect(stopStreamAction_, &QAction::triggered, this, &MainWindow::onStopRtmpStream);
     connect(exitAction, &QAction::triggered, this, &QWidget::close);
     connect(playPauseAction, &QAction::triggered, controller_, &PlaybackController::togglePause);
     connect(fullscreenAction, &QAction::triggered, this, &MainWindow::onToggleFullscreen);
@@ -207,17 +216,27 @@ MainWindow::MainWindow(QWidget* parent)
             });
     connect(controller_, &PlaybackController::playbackRateChanged,
             this, &MainWindow::updatePlaybackRateControl);
+    connect(streamPipeline_, &StreamPipeline::stateChanged,
+            this, &MainWindow::onStreamStateChanged);
+    connect(streamPipeline_, &StreamPipeline::errorOccurred,
+            this, &MainWindow::onStreamErrorOccurred);
+    connect(streamPipeline_, &StreamPipeline::finished,
+            this, &MainWindow::onStreamFinished);
 
     statusLabel_ = new QLabel(statusBar());
     statusLabel_->setMinimumWidth(260);
     statusBar()->addPermanentWidget(statusLabel_, 1);
     updateProfileActions();
+    updateStreamActions();
     updateStatusBar();
     updateOpeningIndicator();
 }
 
 MainWindow::~MainWindow()
 {
+    if (streamPipeline_) {
+        streamPipeline_->stop();
+    }
     if (controller_) {
         controller_->close();
     }
@@ -244,6 +263,9 @@ void MainWindow::openMedia(const QUrl& url)
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    if (streamPipeline_) {
+        streamPipeline_->stop();
+    }
     controller_->close();
     QMainWindow::closeEvent(event);
 }
@@ -348,6 +370,103 @@ void MainWindow::onOpenUrl()
     openMedia(QUrl::fromUserInput(text.trimmed()));
 }
 
+
+void MainWindow::onStartRtmpStream()
+{
+    if (!streamPipeline_ || streamPipeline_->state() == StreamPipeline::State::Connecting ||
+        streamPipeline_->state() == StreamPipeline::State::Streaming) {
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Start RTMP Stream"));
+    auto* form = new QFormLayout(&dialog);
+    auto* inputFile = new QLineEdit(&dialog);
+    auto* browseButton = new QPushButton(QStringLiteral("Browse..."), &dialog);
+    auto* inputRow = new QHBoxLayout();
+    inputRow->addWidget(inputFile, 1);
+    inputRow->addWidget(browseButton);
+    auto* outputUrl = new QLineEdit(QStringLiteral("rtmp://127.0.0.1:1935/live/test"), &dialog);
+    auto* videoBitRate = new QSpinBox(&dialog);
+    videoBitRate->setRange(250, 50000);
+    videoBitRate->setValue(2500);
+    videoBitRate->setSuffix(QStringLiteral(" kbps"));
+    auto* audioBitRate = new QSpinBox(&dialog);
+    audioBitRate->setRange(32, 512);
+    audioBitRate->setValue(128);
+    audioBitRate->setSuffix(QStringLiteral(" kbps"));
+    auto* frameRate = new QSpinBox(&dialog);
+    frameRate->setRange(1, 120);
+    frameRate->setValue(30);
+    auto* gopSeconds = new QSpinBox(&dialog);
+    gopSeconds->setRange(1, 10);
+    gopSeconds->setValue(2);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+
+    form->addRow(QStringLiteral("Input file"), inputRow);
+    form->addRow(QStringLiteral("RTMP URL"), outputUrl);
+    form->addRow(QStringLiteral("Video bitrate"), videoBitRate);
+    form->addRow(QStringLiteral("Audio bitrate"), audioBitRate);
+    form->addRow(QStringLiteral("Frame rate"), frameRate);
+    form->addRow(QStringLiteral("GOP seconds"), gopSeconds);
+    form->addRow(buttons);
+    connect(browseButton, &QPushButton::clicked, &dialog, [this, inputFile] {
+        const QString file = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Select Stream Input"), QString(), QStringLiteral("Media Files (*.*)"));
+        if (!file.isEmpty()) {
+            inputFile->setText(file);
+        }
+    });
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted || inputFile->text().trimmed().isEmpty()) {
+        return;
+    }
+
+    StreamOutputOptions options;
+    options.rtmpUrl = outputUrl->text().trimmed();
+    options.videoBitRate = videoBitRate->value() * 1000;
+    options.audioBitRate = audioBitRate->value() * 1000;
+    options.videoFrameRate = frameRate->value();
+    options.gopSeconds = gopSeconds->value();
+    streamPipeline_->start(QUrl::fromLocalFile(inputFile->text().trimmed()), options);
+}
+
+void MainWindow::onStopRtmpStream()
+{
+    if (streamPipeline_) {
+        streamPipeline_->stop();
+    }
+}
+
+void MainWindow::onStreamStateChanged(StreamPipeline::State state)
+{
+    updateStreamActions();
+    switch (state) {
+    case StreamPipeline::State::Connecting:
+        statusBar()->showMessage(QStringLiteral("Connecting RTMP output..."));
+        break;
+    case StreamPipeline::State::Streaming:
+        statusBar()->showMessage(QStringLiteral("RTMP streaming"));
+        break;
+    case StreamPipeline::State::Idle:
+        break;
+    case StreamPipeline::State::Error:
+        break;
+    }
+}
+
+void MainWindow::onStreamErrorOccurred(int, const QString& message)
+{
+    updateStreamActions();
+    statusBar()->showMessage(QStringLiteral("RTMP stream error: %1").arg(message), 5000);
+}
+
+void MainWindow::onStreamFinished()
+{
+    updateStreamActions();
+    statusBar()->showMessage(QStringLiteral("RTMP stream finished"), 3000);
+}
 void MainWindow::onSwitchRenderer()
 {
     const PlaybackProfile nextProfile = playbackProfile_ == PlaybackProfile::Software
@@ -406,6 +525,7 @@ void MainWindow::onD3D11FallbackRequested(unsigned long long sessionId,
     requestedSessionId_ = controller_->openSessionId();
     installRenderer(PlaybackProfile::Software);
     updateProfileActions();
+    updateStreamActions();
     updateStatusBar();
     statusBar()->showMessage(QStringLiteral("D3D11 unavailable; switched to Software: %1").arg(reason), 5000);
     if (url.isValid() && !url.isEmpty()) {
@@ -476,6 +596,7 @@ void MainWindow::activateProfile(PlaybackProfile profile, bool reopenMedia)
     requestedSessionId_ = controller_->openSessionId();
     const bool installed = installRenderer(profile);
     updateProfileActions();
+    updateStreamActions();
     updateStatusBar();
     statusBar()->showMessage(installed
                                  ? QStringLiteral("%1 profile enabled").arg(QString::fromLatin1(playbackProfileName(playbackProfile_)))
@@ -591,6 +712,20 @@ void MainWindow::updateProfileActions()
         d3d11ProfileAction_->setChecked(playbackProfile_ == PlaybackProfile::D3D11);
     }
 }
+
+void MainWindow::updateStreamActions()
+{
+    const StreamPipeline::State state = streamPipeline_ ? streamPipeline_->state()
+                                                          : StreamPipeline::State::Idle;
+    const bool active = state == StreamPipeline::State::Connecting ||
+                        state == StreamPipeline::State::Streaming;
+    if (startStreamAction_) {
+        startStreamAction_->setEnabled(!active);
+    }
+    if (stopStreamAction_) {
+        stopStreamAction_->setEnabled(active);
+    }
+}
 void MainWindow::setupControlsWidget()
 {
     controlsWidget_ = new QWidget(ui_->centralwidget);
@@ -652,13 +787,11 @@ void MainWindow::setupControlsWidget()
     playPauseButton_ = new QPushButton(QStringLiteral("Play"), controlsWidget_);
     playPauseButton_->setEnabled(false);
     playPauseButton_->setFocusPolicy(Qt::NoFocus);
-
-    stepBackwardButton_ = new QPushButton(QStringLiteral("-1帧"), controlsWidget_);
+    stepBackwardButton_ = new QPushButton(QStringLiteral("-1") + QString::fromUtf8("\xE5\xB8\xA7"), controlsWidget_);
     stepBackwardButton_->setFixedWidth(52);
     stepBackwardButton_->setEnabled(false);
     stepBackwardButton_->setFocusPolicy(Qt::NoFocus);
-
-    stepForwardButton_ = new QPushButton(QStringLiteral("+1帧"), controlsWidget_);
+    stepForwardButton_ = new QPushButton(QStringLiteral("+1") + QString::fromUtf8("\xE5\xB8\xA7"), controlsWidget_);
     stepForwardButton_->setFixedWidth(52);
     stepForwardButton_->setEnabled(false);
     stepForwardButton_->setFocusPolicy(Qt::NoFocus);
