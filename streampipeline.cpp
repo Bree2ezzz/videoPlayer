@@ -451,17 +451,17 @@ void StreamPipeline::finishSetup(unsigned long long generation,
     audioEncoder_->setPtsMapper([this](const AVFrame* frame, AVRational timeBase) {
         return mapFramePts(frame, timeBase, audioEncoder_->timeBase(), false);
     });
+    {
+        std::lock_guard<std::mutex> lock(pacingMutex_);
+        pacingAnchorInitialized_ = false;
+        pacingAnchorMediaUs_ = 0;
+        pacingAnchorWallTime_ = {};
+    }
     videoEncoder_->setPacketCallback([this, generation](const AVPacket* packet, AVRational timeBase) {
-        if (generation != generation_.load() || abort_ || !muxer_) {
-            return AVERROR_EXIT;
-        }
-        return muxer_->writePacket(videoMuxStream_, packet, timeBase);
+        return writeTimedPacket(generation, videoMuxStream_, packet, timeBase);
     });
     audioEncoder_->setPacketCallback([this, generation](const AVPacket* packet, AVRational timeBase) {
-        if (generation != generation_.load() || abort_ || !muxer_) {
-            return AVERROR_EXIT;
-        }
-        return muxer_->writePacket(audioMuxStream_, packet, timeBase);
+        return writeTimedPacket(generation, audioMuxStream_, packet, timeBase);
     });
     videoEncoder_->setErrorCallback([this, generation](int error, const std::string& message) {
         postError(generation, error, message);
@@ -528,6 +528,12 @@ void StreamPipeline::teardownActivePipeline()
     muxer_.reset();
     videoMuxStream_ = -1;
     audioMuxStream_ = -1;
+    {
+        std::lock_guard<std::mutex> lock(pacingMutex_);
+        pacingAnchorInitialized_ = false;
+        pacingAnchorMediaUs_ = 0;
+        pacingAnchorWallTime_ = {};
+    }
 }
 
 void StreamPipeline::postError(unsigned long long generation,
@@ -604,6 +610,62 @@ void StreamPipeline::handleFinished(unsigned long long generation)
     teardownActivePipeline();
     transitionTo(State::Idle);
     emit finished();
+}
+
+int StreamPipeline::writeTimedPacket(unsigned long long generation,
+                                     int muxStreamIndex,
+                                     const AVPacket* packet,
+                                     AVRational encoderTimeBase)
+{
+    if (generation != generation_.load() || abort_ || !muxer_) {
+        return AVERROR_EXIT;
+    }
+
+    int64_t packetTime = packet ? packet->dts : AV_NOPTS_VALUE;
+    if (packetTime == AV_NOPTS_VALUE && packet) {
+        packetTime = packet->pts;
+    }
+    if (packetTime != AV_NOPTS_VALUE && encoderTimeBase.num > 0 && encoderTimeBase.den > 0) {
+        const int64_t packetTimeUs = std::max<int64_t>(0, av_rescale_q(packetTime, encoderTimeBase, AV_TIME_BASE_Q));
+        const int waitRet = waitUntilPacketDeadline(generation, packetTimeUs);
+        if (waitRet < 0) {
+            return waitRet;
+        }
+    }
+
+    if (generation != generation_.load() || abort_ || !muxer_) {
+        return AVERROR_EXIT;
+    }
+    return muxer_->writePacket(muxStreamIndex, packet, encoderTimeBase);
+}
+
+int StreamPipeline::waitUntilPacketDeadline(unsigned long long generation, int64_t packetTimeUs)
+{
+    using clock = std::chrono::steady_clock;
+
+    clock::time_point deadline;
+    {
+        std::lock_guard<std::mutex> lock(pacingMutex_);
+        if (!pacingAnchorInitialized_) {
+            pacingAnchorInitialized_ = true;
+            pacingAnchorMediaUs_ = packetTimeUs;
+            pacingAnchorWallTime_ = clock::now();
+        }
+        const int64_t relativeUs = std::max<int64_t>(0, packetTimeUs - pacingAnchorMediaUs_);
+        deadline = pacingAnchorWallTime_ + std::chrono::microseconds(relativeUs);
+    }
+
+    while (!abort_ && generation == generation_.load()) {
+        const auto now = clock::now();
+        if (now >= deadline) {
+            return 0;
+        }
+        const auto remaining = deadline - now;
+        const auto maxSlice = clock::duration(std::chrono::milliseconds(5));
+        const auto slice = std::min(remaining, maxSlice);
+        std::this_thread::sleep_for(slice);
+    }
+    return AVERROR_EXIT;
 }
 
 int64_t StreamPipeline::mapFramePts(const AVFrame* frame,

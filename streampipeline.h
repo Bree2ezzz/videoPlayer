@@ -18,6 +18,7 @@ extern "C" {
 #include <string>
 #include <mutex>
 #include <thread>
+#include <chrono>
 
 class Encoder;
 class VideoEncoder;
@@ -101,6 +102,11 @@ private:
     void handleError(unsigned long long generation, int errCode, const QString& message);
     void onEncoderEof(unsigned long long generation, bool video);
     void handleFinished(unsigned long long generation);
+    int writeTimedPacket(unsigned long long generation,
+                         int muxStreamIndex,
+                         const AVPacket* packet,
+                         AVRational encoderTimeBase);
+    int waitUntilPacketDeadline(unsigned long long generation, int64_t packetTimeUs);
     int64_t mapFramePts(const AVFrame* frame,
                         AVRational inputTimeBase,
                         AVRational encoderTimeBase,
@@ -123,6 +129,10 @@ private:
     std::mutex timelineMutex_;
     int64_t timelineStartUs_ = AV_NOPTS_VALUE;
     int64_t syntheticVideoPts_ = -1;
+    std::mutex pacingMutex_;
+    bool pacingAnchorInitialized_ = false;
+    std::chrono::steady_clock::time_point pacingAnchorWallTime_{};
+    int64_t pacingAnchorMediaUs_ = 0;
     std::mutex eofMutex_;
     bool videoEncoderEof_ = false;
     bool audioEncoderEof_ = false;
